@@ -128,7 +128,11 @@ postgres = [
 # bookworm. This libpq5 includes support for postgres 18 and psycopg will fail to build
 # below this selected version.
 # See: https://github.com/psycopg/psycopg/pull/1084
-psycopg = ["psycopg[c]>=3.2.8"]
+psycopg = [
+    "psycopg[c]>=3.2.8",
+    "psycopg_pool>=3.1"
+]
+
 saml2 = [
     "pysaml2>=4.5.0",
 
@@ -184,6 +188,7 @@ all = [
     "psycopg2cffi-compat==1.1;platform_python_implementation == 'PyPy'",
     # experimental psycopg for postgres
     "psycopg[c]>=3.2.8",
+    "psycopg_pool>=3.1",
     # saml2
     "pysaml2>=4.5.0",
     # oidc and jwt

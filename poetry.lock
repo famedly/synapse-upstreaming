@@ -1870,6 +1870,25 @@ files = [
 ]
 
 [[package]]
+name = "psycopg-pool"
+version = "3.3.0"
+description = "Connection Pool for Psycopg"
+optional = true
+python-versions = ">=3.10"
+groups = ["main"]
+markers = "extra == \"psycopg\" or extra == \"all\""
+files = [
+    {file = "psycopg_pool-3.3.0-py3-none-any.whl", hash = "sha256:2e44329155c410b5e8666372db44276a8b1ebd8c90f1c3026ebba40d4bc81063"},
+    {file = "psycopg_pool-3.3.0.tar.gz", hash = "sha256:fa115eb2860bd88fce1717d75611f41490dec6135efb619611142b24da3f6db5"},
+]
+
+[package.dependencies]
+typing-extensions = ">=4.6"
+
+[package.extras]
+test = ["anyio (>=4.0)", "mypy (>=1.14)", "pproxy (>=2.7)", "pytest (>=6.2.5)", "pytest-cov (>=3.0)", "pytest-randomly (>=3.5)"]
+
+[[package]]
 name = "psycopg2"
 version = "2.9.11"
 description = "psycopg2 - Python-PostgreSQL Database Adapter"
@@ -3591,14 +3610,14 @@ docs = ["Sphinx", "repoze.sphinx.autointerface"]
 test = ["zope.i18nmessageid", "zope.testing", "zope.testrunner"]
 
 [extras]
-all = ["authlib", "defusedxml", "hiredis", "jaeger-client", "lxml", "matrix-synapse-ldap3", "opentracing", "psycopg", "psycopg2", "psycopg2cffi", "psycopg2cffi-compat", "pympler", "pysaml2", "pytz", "sentry-sdk", "thrift", "tornado", "txredisapi"]
+all = ["authlib", "defusedxml", "hiredis", "jaeger-client", "lxml", "matrix-synapse-ldap3", "opentracing", "psycopg", "psycopg2", "psycopg2cffi", "psycopg2cffi-compat", "psycopg_pool", "pympler", "pysaml2", "pytz", "sentry-sdk", "thrift", "tornado", "txredisapi"]
 cache-memory = ["pympler"]
 jwt = ["authlib"]
 matrix-synapse-ldap3 = ["matrix-synapse-ldap3"]
 oidc = ["authlib"]
 opentracing = ["jaeger-client", "opentracing", "thrift", "tornado"]
 postgres = ["psycopg2", "psycopg2cffi", "psycopg2cffi-compat"]
-psycopg = ["psycopg"]
+psycopg = ["psycopg", "psycopg_pool"]
 redis = ["hiredis", "txredisapi"]
 saml2 = ["defusedxml", "pysaml2", "pytz"]
 sentry = ["sentry-sdk"]
@@ -3609,4 +3628,4 @@ url-preview = ["lxml"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10.0,<4.0.0"
-content-hash = "6d25a3de1875cabf4fda06042a325bc64149bcf8528a34c8669357c75a4bd0d9"
+content-hash = "89b0fa30239bb36115c3d53e7eff014604b3f45996e1a2daa1ffcb5ecb750fe6"
