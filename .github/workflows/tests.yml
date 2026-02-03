@@ -445,7 +445,7 @@ jobs:
       # their build dependencies
       - run: |
           sudo apt-get -qq update
-          sudo apt-get -qq install build-essential libffi-dev python3-dev \
+          sudo apt-get install build-essential libffi-dev python3-dev \
             libxml2-dev libxslt-dev xmlsec1 zlib1g-dev libjpeg-dev libwebp-dev
 
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
