@@ -46,6 +46,7 @@ from typing import (
 from unittest.mock import Mock, patch
 
 import attr
+import psycopg_pool
 from incremental import Version
 from typing_extensions import ParamSpec
 from zope.interface import implementer
@@ -736,7 +737,7 @@ def make_fake_db_pool(
     db_config: DatabaseConnectionConfig,
     engine: BaseDatabaseEngine,
     server_name: str,
-) -> adbapi.ConnectionPool:
+) -> adbapi.ConnectionPool | psycopg_pool.ConnectionPool:
     """Wrapper for `make_pool` which builds a pool which runs db queries synchronously.
 
     For more deterministic testing, we don't use a regular db connection pool: instead
@@ -747,6 +748,8 @@ def make_fake_db_pool(
     pool = make_pool(
         reactor=reactor, db_config=db_config, engine=engine, server_name=server_name
     )
+    if isinstance(pool, psycopg_pool.ConnectionPool):
+        return pool
 
     def runWithConnection(
         func: Callable[..., R], *args: Any, **kwargs: Any
