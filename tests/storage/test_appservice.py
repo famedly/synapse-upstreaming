@@ -21,7 +21,7 @@
 import json
 import os
 import tempfile
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
 import yaml
@@ -33,7 +33,12 @@ from synapse.appservice import ApplicationService, ApplicationServiceState
 from synapse.config._base import ConfigError
 from synapse.events import EventBase
 from synapse.server import HomeServer
-from synapse.storage.database import DatabasePool, LoggingDatabaseConnection, make_conn
+from synapse.storage.database import (
+    DatabasePool,
+    LoggingDatabaseConnection,
+    LoggingTransaction,
+    make_conn,
+)
 from synapse.storage.databases.main.appservice import (
     ApplicationServiceStore,
     ApplicationServiceTransactionStore,
@@ -122,12 +127,8 @@ class ApplicationServiceStoreTestCase(unittest.HomeserverTestCase):
 
 class ApplicationServiceTransactionStoreTestCase(unittest.HomeserverTestCase):
     def setUp(self) -> None:
-        super().setUp()
+        # Prepare the appservice config files
         self.as_yaml_files: list[str] = []
-
-        self.hs.config.appservice.app_service_config_files = self.as_yaml_files
-        self.hs.config.caches.event_cache_size = 1
-
         self.as_list = [
             {"token": "token1", "url": "https://matrix-as.org", "id": "id_1"},
             {"token": "alpha_tok", "url": "https://alpha.com", "id": "id_alpha"},
@@ -137,25 +138,22 @@ class ApplicationServiceTransactionStoreTestCase(unittest.HomeserverTestCase):
         for s in self.as_list:
             self._add_service(s["url"], s["token"], s["id"])
 
-        self.as_yaml_files = []
+        # setUp() calls default_config() which will add the files to the config.
+        # Specifically, this needs to be after self.as_list is declared. One relies on
+        # the other
+        super().setUp()
+        self.hs.config.caches.event_cache_size = 1
 
-        # We assume there is only one database in these tests
-        database = self.hs.get_datastores().databases[0]
-        self.db_pool = database._db_pool
-        self.engine = database.engine
+        # We assume there is only one database in these tests, and we need to borrow
+        # its pool
+        self.db_pool = self.hs.get_datastores().databases[0]
+        self.store = self.hs.get_datastores().main
 
-        server_name = self.hs.hostname
-        db_config = self.hs.config.database.get_single_database()
-        self.store = TestTransactionStore(
-            database,
-            make_conn(
-                db_config=db_config,
-                engine=self.engine,
-                default_txn_name="test",
-                server_name=server_name,
-            ),
-            self.hs,
-        )
+    def default_config(self) -> dict[str, Any]:
+        config = super().default_config()
+        config_files = config.setdefault("app_service_config_files", [])
+        config_files.extend(x["token"] for x in self.as_list)
+        return config
 
     def _add_service(self, url: str, as_token: str, id: str) -> None:
         as_yaml = {
@@ -171,24 +169,24 @@ class ApplicationServiceTransactionStoreTestCase(unittest.HomeserverTestCase):
             outfile.write(yaml.dump(as_yaml))
             self.as_yaml_files.append(as_token)
 
-    def _set_state(self, id: str, state: ApplicationServiceState) -> defer.Deferred:
-        return self.db_pool.runOperation(
-            self.engine.convert_param_style(
-                "INSERT INTO application_services_state(as_id, state) VALUES(?,?)"
-            ),
-            (id, state.value),
-        )
+    async def _set_state(self, id: str, state: ApplicationServiceState) -> None:
+        def _set_state_txn(txn: LoggingTransaction) -> None:
+            return txn.execute(
+                "INSERT INTO application_services_state(as_id, state) VALUES(?,?)",
+                (id, state.value),
+            )
 
-    def _insert_txn(
-        self, as_id: str, txn_id: int, events: list[Mock]
-    ) -> "defer.Deferred[None]":
-        return self.db_pool.runOperation(
-            self.engine.convert_param_style(
+        return await self.db_pool.runInteraction("_set_state", _set_state_txn)
+
+    async def _insert_txn(self, as_id: str, txn_id: int, events: list[Mock]) -> None:
+        def _insert_txn(txn: LoggingTransaction) -> None:
+            return txn.execute(
                 "INSERT INTO application_services_txns(as_id, txn_id, event_ids) "
-                "VALUES(?,?,?)"
-            ),
-            (as_id, txn_id, json.dumps([e.event_id for e in events])),
-        )
+                "VALUES(?,?,?)",
+                (as_id, txn_id, json.dumps([e.event_id for e in events])),
+            )
+
+        return await self.db_pool.runInteraction("_insert_txn", _insert_txn)
 
     def test_get_appservice_state_none(
         self,
@@ -240,14 +238,15 @@ class ApplicationServiceTransactionStoreTestCase(unittest.HomeserverTestCase):
         self.get_success(
             self.store.set_appservice_state(service, ApplicationServiceState.DOWN)
         )
-        rows = self.get_success(
-            self.db_pool.runQuery(
-                self.engine.convert_param_style(
-                    "SELECT as_id FROM application_services_state WHERE state=?"
-                ),
+
+        def _txn(txn: LoggingTransaction) -> list[tuple]:
+            txn.execute(
+                "SELECT as_id FROM application_services_state WHERE state=?",
                 (ApplicationServiceState.DOWN.value,),
             )
-        )
+            return txn.fetchall()
+
+        rows = self.get_success(self.db_pool.runInteraction("_test", _txn))
         self.assertEqual(service.id, rows[0][0])
 
     def test_set_appservices_state_multiple_up(
@@ -263,14 +262,15 @@ class ApplicationServiceTransactionStoreTestCase(unittest.HomeserverTestCase):
         self.get_success(
             self.store.set_appservice_state(service, ApplicationServiceState.UP)
         )
-        rows = self.get_success(
-            self.db_pool.runQuery(
-                self.engine.convert_param_style(
-                    "SELECT as_id FROM application_services_state WHERE state=?"
-                ),
+
+        def _txn(txn: LoggingTransaction) -> list[tuple]:
+            txn.execute(
+                "SELECT as_id FROM application_services_state WHERE state=?",
                 (ApplicationServiceState.UP.value,),
             )
-        )
+            return txn.fetchall()
+
+        rows = self.get_success(self.db_pool.runInteraction("_test", _txn))
         self.assertEqual(service.id, rows[0][0])
 
     def test_create_appservice_txn_first(
@@ -301,14 +301,13 @@ class ApplicationServiceTransactionStoreTestCase(unittest.HomeserverTestCase):
             self.store.complete_appservice_txn(txn_id=txn_id, service=service)
         )
 
-        res = self.get_success(
-            self.db_pool.runQuery(
-                self.engine.convert_param_style(
-                    "SELECT * FROM application_services_txns WHERE txn_id=?"
-                ),
-                (txn_id,),
+        def _txn(txn: LoggingTransaction) -> list[tuple]:
+            txn.execute(
+                "SELECT * FROM application_services_txns WHERE txn_id=?", (txn_id,)
             )
-        )
+            return txn.fetchall()
+
+        res = self.get_success(self.db_pool.runInteraction("_test", _txn))
         self.assertEqual(0, len(res))
 
     def test_complete_appservice_txn_updates_last_txn_state(
@@ -317,31 +316,32 @@ class ApplicationServiceTransactionStoreTestCase(unittest.HomeserverTestCase):
         service = Mock(id=self.as_list[0]["id"])
         events = [Mock(event_id="e1"), Mock(event_id="e2")]
         txn_id = 5
-        self._set_state(self.as_list[0]["id"], ApplicationServiceState.UP)
+        self.get_success(
+            self._set_state(self.as_list[0]["id"], ApplicationServiceState.UP)
+        )
         self.get_success(self._insert_txn(service.id, txn_id, events))
         self.get_success(
             self.store.complete_appservice_txn(txn_id=txn_id, service=service)
         )
 
-        res = self.get_success(
-            self.db_pool.runQuery(
-                self.engine.convert_param_style(
-                    "SELECT state FROM application_services_state WHERE as_id=?"
-                ),
+        def _txn_state(txn: LoggingTransaction) -> list[tuple]:
+            txn.execute(
+                "SELECT state FROM application_services_state WHERE as_id=?",
                 (service.id,),
             )
-        )
+            return txn.fetchall()
+
+        res = self.get_success(self.db_pool.runInteraction("_test", _txn_state))
         self.assertEqual(1, len(res))
         self.assertEqual(ApplicationServiceState.UP.value, res[0][0])
 
-        res = self.get_success(
-            self.db_pool.runQuery(
-                self.engine.convert_param_style(
-                    "SELECT * FROM application_services_txns WHERE txn_id=?"
-                ),
-                (txn_id,),
+        def _txn_all(txn: LoggingTransaction) -> list[tuple]:
+            txn.execute(
+                "SELECT * FROM application_services_txns WHERE txn_id=?", (txn_id,)
             )
-        )
+            return txn.fetchall()
+
+        res = self.get_success(self.db_pool.runInteraction("_test", _txn_all))
         self.assertEqual(0, len(res))
 
     def test_get_oldest_unsent_txn_none(
