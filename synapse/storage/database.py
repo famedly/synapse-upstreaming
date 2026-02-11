@@ -2577,6 +2577,8 @@ class DatabasePool(abc.ABC):
 
 
 class TwistedDatabasePool(DatabasePool):
+    _db_pool: adbapi.ConnectionPool
+
     def is_running(self) -> bool:
         """Is the database pool currently running"""
         return self._db_pool.running
@@ -2770,6 +2772,8 @@ class TwistedDatabasePool(DatabasePool):
 
 
 class PsycopgDatabasePool(DatabasePool):
+    _db_pool: psycopg_pool.ConnectionPool[Any]
+
     def is_running(self) -> bool:
         """Is the database pool currently running"""
         return self._db_pool._opened and not self._db_pool.closed
