@@ -25,6 +25,8 @@ import random
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Iterable
 
+from twisted.internet.defer import CancelledError
+
 from synapse import types
 from synapse.api.constants import (
     AccountDataTypes,
@@ -2205,6 +2207,10 @@ class RoomForgetterHandler(StateDeltasHandler):
         async def process() -> None:
             try:
                 await self._unsafe_process()
+            except CancelledError:
+                logger.warning(
+                    "_unsafe_process() is shutting down mid-process. Should be fine"
+                )
             finally:
                 self._is_processing = False
 
