@@ -54,7 +54,9 @@ class SQLBaseStoreTestCase(unittest.TestCase):
 
             if USE_POSTGRES_FOR_TESTS == "psycopg":
                 conn_attributes += ["autocommit"]
-
+                self.mock_conn = Mock(spec_set=conn_attributes)
+                conn_pool.getconn = Mock(return_value=self.mock_conn)
+                conn_pool.putconn = Mock()
                 # copy returns a context manager which needs assertions.
                 self.mock_copy = Mock(spec_set=["write_row", "rows"])
                 self.mock_txn.copy.return_value.__enter__ = Mock(
@@ -77,7 +79,7 @@ class SQLBaseStoreTestCase(unittest.TestCase):
                 )
                 self.execute_values_patcher.start()
 
-            self.mock_conn = Mock(spec_set=conn_attributes)
+                self.mock_conn = Mock(spec_set=conn_attributes)
             self.mock_conn.encoding = "UNICODE"
         else:
             self.mock_conn = Mock(spec_set=["cursor", "rollback", "commit"])
