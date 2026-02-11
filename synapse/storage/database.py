@@ -772,9 +772,8 @@ class DatabasePool(abc.ABC):
         "Return the name of this database"
         return self._database_config.name
 
-    def is_running(self) -> bool:
-        """Is the database pool currently running"""
-        return self._db_pool.running
+    @abc.abstractmethod
+    def is_running(self) -> bool: ...
 
     async def _check_safe_to_upsert(self) -> None:
         """
@@ -2578,6 +2577,10 @@ class DatabasePool(abc.ABC):
 
 
 class TwistedDatabasePool(DatabasePool):
+    def is_running(self) -> bool:
+        """Is the database pool currently running"""
+        return self._db_pool.running
+
     async def runInteraction(
         self,
         desc: str,
@@ -2767,6 +2770,10 @@ class TwistedDatabasePool(DatabasePool):
 
 
 class PsycopgDatabasePool(DatabasePool):
+    def is_running(self) -> bool:
+        """Is the database pool currently running"""
+        return self._db_pool._opened and not self._db_pool.closed
+
     async def runInteraction(
         self,
         desc: str,
