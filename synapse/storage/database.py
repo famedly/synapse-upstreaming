@@ -44,6 +44,8 @@ from typing import (
 )
 
 import attr
+import psycopg
+import psycopg_pool
 from prometheus_client import Counter, Histogram
 from typing_extensions import Concatenate, ParamSpec
 
@@ -55,6 +57,7 @@ from synapse.config.database import DatabaseConnectionConfig
 from synapse.logging import opentracing
 from synapse.logging.context import (
     LoggingContext,
+    PreserveLoggingContext,
     current_context,
     make_deferred_yieldable,
 )
@@ -139,11 +142,15 @@ def make_pool(
     db_config: DatabaseConnectionConfig,
     engine: BaseDatabaseEngine,
     server_name: str,
-) -> adbapi.ConnectionPool:
+) -> adbapi.ConnectionPool | psycopg_pool.ConnectionPool:
     """
     Create the actual database pool based on it's engine. The fallback is the adbapi
     compatible Twisted pool.
     """
+    if isinstance(engine, PsycopgEngine):
+        return make_psycopg_pool(
+            reactor=reactor, db_config=db_config, engine=engine, server_name=server_name
+        )
     return make_twisted_pool(
         reactor=reactor, db_config=db_config, engine=engine, server_name=server_name
     )
@@ -188,6 +195,49 @@ def make_twisted_pool(
         server_name=server_name,
         threadpool=connection_pool.threadpool,
     )
+
+    return connection_pool
+
+
+def make_psycopg_pool(
+    *,
+    reactor: IReactorCore,
+    db_config: DatabaseConnectionConfig,
+    engine: PsycopgEngine,
+    server_name: str,
+) -> psycopg_pool.ConnectionPool:
+    """Get the specialized Psycopg connection pool for the database. Only works with
+    Postgres and version 3+ of the Psycopg driver."""
+
+    db_args = dict(db_config.config.get("args", {}))
+    # TODO: clean these, the twisted pool and this one do not share compatible options
+
+    def _on_new_connection(conn: psycopg.Connection[Any]) -> None:
+        # Ensure we have a logging context so we can correctly track queries,
+        # etc.
+        with LoggingContext(name="db.on_new_connection", server_name=server_name):
+            engine.on_new_connection(
+                LoggingDatabaseConnection(
+                    conn=conn,  # type: ignore[arg-type]
+                    engine=engine,
+                    default_txn_name="on_new_connection",
+                    server_name=server_name,
+                )
+            )
+
+    connection_pool = psycopg_pool.ConnectionPool(
+        "",
+        configure=_on_new_connection,
+        kwargs=db_args,
+    )
+
+    # Not sure we can access the thread pool inside the psycopg connection pool. It is
+    # only used to produce connections and not for running any kind of transactions.
+    # register_threadpool(
+    #     name=f"database-{db_config.name}",
+    #     server_name=server_name,
+    #     threadpool=connection_pool.threadpool,
+    # )
 
     return connection_pool
 
@@ -2900,6 +2950,8 @@ def create_database_pool_class(
     database_config: DatabaseConnectionConfig,
     engine: BaseDatabaseEngine,
 ) -> DatabasePool:
+    if isinstance(engine, PsycopgEngine):
+        return PsycopgDatabasePool(hs, database_config, engine)
     return TwistedDatabasePool(hs, database_config, engine)
 
 
