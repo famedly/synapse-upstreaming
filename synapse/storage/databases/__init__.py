@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Generic, TypeVar
 
 from synapse.metrics import SERVER_NAME_LABEL, LaterGauge
 from synapse.storage._base import SQLBaseStore
-from synapse.storage.database import DatabasePool, make_conn
+from synapse.storage.database import DatabasePool, create_database_pool_class, make_conn
 from synapse.storage.databases.main.events import PersistEventsStore
 from synapse.storage.databases.state import StateGroupDataStore
 from synapse.storage.databases.state.deletion import StateDeletionDataStore
@@ -104,7 +104,7 @@ class Databases(Generic[DataStoreT]):
                     databases=database_config.databases,
                 )
 
-                database = DatabasePool(hs, database_config, engine)
+                database = create_database_pool_class(hs, database_config, engine)
 
                 if "main" in database_config.databases:
                     logger.info(

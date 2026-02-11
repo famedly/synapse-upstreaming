@@ -54,7 +54,11 @@ from synapse.logging.context import (
 )
 from synapse.server import HomeServer
 from synapse.storage import DataStore
-from synapse.storage.database import DatabasePool, LoggingTransaction, make_conn
+from synapse.storage.database import (
+    LoggingTransaction,
+    create_database_pool_class,
+    make_conn,
+)
 from synapse.storage.databases.main import FilteringWorkerStore
 from synapse.storage.databases.main.account_data import AccountDataWorkerStore
 from synapse.storage.databases.main.client_ips import ClientIpBackgroundUpdateStore
@@ -670,7 +674,7 @@ class Porter:
             prepare_database(db_conn, engine, config=self.hs.config)
             # Type safety: ignore that we're using Mock homeservers here.
             store = Store(
-                DatabasePool(
+                create_database_pool_class(
                     self.hs,
                     db_config,
                     engine,

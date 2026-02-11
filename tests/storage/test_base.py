@@ -26,7 +26,7 @@ from unittest.mock import Mock, call, patch
 from twisted.internet import defer
 
 from synapse.storage._base import SQLBaseStore
-from synapse.storage.database import DatabasePool
+from synapse.storage.database import create_database_pool_class
 from synapse.storage.engines import create_engine
 
 from tests import unittest
@@ -117,7 +117,7 @@ class SQLBaseStoreTestCase(unittest.TestCase):
         # To fix isinstance(...) checks.
         fake_engine.__class__ = engine.__class__  # type: ignore[assignment]
 
-        db = DatabasePool(Mock(), Mock(config=db_config), fake_engine)
+        db = create_database_pool_class(Mock(), Mock(config=db_config), fake_engine)
         db._db_pool = conn_pool
 
         self.datastore = SQLBaseStore(db, None, hs)  # type: ignore[arg-type]

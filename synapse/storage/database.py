@@ -19,6 +19,7 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+import abc
 import inspect
 import itertools
 import logging
@@ -139,7 +140,23 @@ def make_pool(
     engine: BaseDatabaseEngine,
     server_name: str,
 ) -> adbapi.ConnectionPool:
-    """Get the connection pool for the database."""
+    """
+    Create the actual database pool based on it's engine. The fallback is the adbapi
+    compatible Twisted pool.
+    """
+    return make_twisted_pool(
+        reactor=reactor, db_config=db_config, engine=engine, server_name=server_name
+    )
+
+
+def make_twisted_pool(
+    *,
+    reactor: IReactorCore,
+    db_config: DatabaseConnectionConfig,
+    engine: BaseDatabaseEngine,
+    server_name: str,
+) -> adbapi.ConnectionPool:
+    """Get the adbapi compatible connection pool for the database."""
 
     # By default enable `cp_reconnect`. We need to fiddle with db_args in case
     # someone has explicitly set `cp_reconnect`.
@@ -632,8 +649,11 @@ class PerformanceCounters:
         return top_n_counters
 
 
-class DatabasePool:
-    """Wraps a single physical database and connection pool.
+class DatabasePool(abc.ABC):
+    """
+    Provides an abstract Base for the database pool. Distinct flavors of database pool
+    inherit from this to provide specialized methods for adding or retrieving information
+    from the database.
 
     A single database may be used by multiple data stores.
     """
@@ -985,6 +1005,7 @@ class DatabasePool:
                 **{SERVER_NAME_LABEL: self.server_name},
             ).inc(duration)
 
+    @abc.abstractmethod
     async def runInteraction(
         self,
         desc: str,
@@ -993,81 +1014,9 @@ class DatabasePool:
         db_autocommit: bool = False,
         isolation_level: IsolationLevel | None = None,
         **kwargs: Any,
-    ) -> R:
-        """Starts a transaction on the database and runs a given function
+    ) -> R: ...
 
-        Arguments:
-            desc: description of the transaction, for logging and metrics
-            func: callback function, which will be called with a
-                database transaction (twisted.enterprise.adbapi.Transaction) as
-                its first argument, followed by `args` and `kwargs`.
-
-            db_autocommit: Whether to run the function in "autocommit" mode,
-                i.e. outside of a transaction. This is useful for transactions
-                that are only a single query.
-
-                Currently, this is only implemented for Postgres. SQLite will still
-                run the function inside a transaction.
-
-                WARNING: This means that if func fails half way through then
-                the changes will *not* be rolled back. `func` may also get
-                called multiple times if the transaction is retried, so must
-                correctly handle that case.
-
-            isolation_level: Set the server isolation level for this transaction.
-            args: positional args to pass to `func`
-            kwargs: named args to pass to `func`
-
-        Returns:
-            The result of func
-        """
-
-        async def _runInteraction() -> R:
-            after_callbacks: list[_CallbackListEntry] = []
-            async_after_callbacks: list[_AsyncCallbackListEntry] = []
-            exception_callbacks: list[_CallbackListEntry] = []
-
-            if not current_context():
-                logger.warning("Starting db txn '%s' from sentinel context", desc)
-
-            try:
-                with opentracing.start_active_span(f"db.{desc}"):
-                    result: R = await self.runWithConnection(
-                        # mypy seems to have an issue with this, maybe a bug?
-                        self.new_transaction,
-                        desc,
-                        after_callbacks,
-                        async_after_callbacks,
-                        exception_callbacks,
-                        func,
-                        *args,
-                        db_autocommit=db_autocommit,
-                        isolation_level=isolation_level,
-                        **kwargs,
-                    )
-
-                # We order these assuming that async functions call out to external
-                # systems (e.g. to invalidate a cache) and the sync functions make these
-                # changes on any local in-memory caches/similar, and thus must be second.
-                for async_callback, async_args, async_kwargs in async_after_callbacks:
-                    await async_callback(*async_args, **async_kwargs)
-                for after_callback, after_args, after_kwargs in after_callbacks:
-                    after_callback(*after_args, **after_kwargs)
-                return result
-            except Exception:
-                for exception_callback, after_args, after_kwargs in exception_callbacks:
-                    exception_callback(*after_args, **after_kwargs)
-                raise
-
-        # To handle cancellation, we ensure that `after_callback`s and
-        # `exception_callback`s are always run, since the transaction will complete
-        # on another thread regardless of cancellation.
-        #
-        # We also wait until everything above is done before releasing the
-        # `CancelledError`, so that logging contexts won't get used after they have been
-        # finished.
-        return await delay_cancellation(_runInteraction())
-
+    @abc.abstractmethod
     async def runWithConnection(
         self,
         func: Callable[Concatenate[LoggingDatabaseConnection, P], R],
@@ -1075,102 +1024,7 @@ class DatabasePool:
         db_autocommit: bool = False,
         isolation_level: IsolationLevel | None = None,
         **kwargs: Any,
-    ) -> R:
-        """Wraps the .runWithConnection() method on the underlying db_pool.
-
-        Arguments:
-            func: callback function, which will be called with a
-                database connection (twisted.enterprise.adbapi.Connection) as
-                its first argument, followed by `args` and `kwargs`.
-            args: positional args to pass to `func`
-            db_autocommit: Whether to run the function in "autocommit" mode,
-                i.e. outside of a transaction. This is useful for transaction
-                that are only a single query. Currently only affects postgres.
-            isolation_level: Set the server isolation level for this transaction.
-            kwargs: named args to pass to `func`
-
-        Returns:
-            The result of func
-        """
-        curr_context = current_context()
-        if not curr_context:
-            logger.warning(
-                "Starting db connection from sentinel context: metrics will be lost"
-            )
-            parent_context = None
-        else:
-            assert isinstance(curr_context, LoggingContext)
-            parent_context = curr_context
-
-        start_time = monotonic_time()
-
-        def inner_func(conn: _PoolConnection, *args: P.args, **kwargs: P.kwargs) -> R:
-            # We shouldn't be in a transaction. If we are then something
-            # somewhere hasn't committed after doing work. (This is likely only
-            # possible during startup, as `run*` will ensure changes are
-            # committed/rolled back before putting the connection back in the
-            # pool).
-            assert not self.engine.in_transaction(conn)
-
-            with LoggingContext(
-                name=str(curr_context),
-                server_name=self.server_name,
-                parent_context=parent_context,
-            ) as context:
-                with opentracing.start_active_span(
-                    operation_name="db.connection",
-                ):
-                    sched_duration_sec = monotonic_time() - start_time
-                    sql_scheduling_timer.labels(
-                        **{SERVER_NAME_LABEL: self.server_name}
-                    ).observe(sched_duration_sec)
-                    context.add_database_scheduled(sched_duration_sec)
-
-                    if self._txn_limit > 0:
-                        tid = self._db_pool.threadID()
-                        self._txn_counters[tid] += 1
-
-                        if self._txn_counters[tid] > self._txn_limit:
-                            logger.debug(
-                                "Reconnecting database connection over transaction limit"
-                            )
-                            conn.reconnect()
-                            opentracing.log_kv(
-                                {"message": "reconnected due to txn limit"}
-                            )
-                            self._txn_counters[tid] = 1
-
-                    if self.engine.is_connection_closed(conn):
-                        logger.debug("Reconnecting closed database connection")
-                        conn.reconnect()
-                        opentracing.log_kv({"message": "reconnected"})
-                        if self._txn_limit > 0:
-                            self._txn_counters[tid] = 1
-
-                    try:
-                        if db_autocommit:
-                            self.engine.attempt_to_set_autocommit(conn, True)
-                        if isolation_level is not None:
-                            self.engine.attempt_to_set_isolation_level(
-                                conn, isolation_level
-                            )
-
-                        db_conn = LoggingDatabaseConnection(
-                            conn=conn,
-                            engine=self.engine,
-                            default_txn_name="runWithConnection",
-                            server_name=self.server_name,
-                        )
-                        return func(db_conn, *args, **kwargs)
-                    finally:
-                        if db_autocommit:
-                            self.engine.attempt_to_set_autocommit(conn, False)
-                        if isolation_level:
-                            self.engine.attempt_to_set_isolation_level(conn, None)
-
-        return await make_deferred_yieldable(
-            self._db_pool.runWithConnection(inner_func, *args, **kwargs)
-        )
+    ) -> R: ...
 
     async def execute(self, desc: str, query: str, *args: Any) -> list[tuple[Any, ...]]:
         """Runs a single query for a result set.
@@ -2671,6 +2525,203 @@ class DatabasePool:
         txn.execute(sql, arg_list + [limit, start])
 
         return txn.fetchall()
+
+
+class TwistedDatabasePool(DatabasePool):
+    async def runInteraction(
+        self,
+        desc: str,
+        func: Callable[..., R],
+        *args: Any,
+        db_autocommit: bool = False,
+        isolation_level: IsolationLevel | None = None,
+        **kwargs: Any,
+    ) -> R:
+        """Starts a transaction on the database and runs a given function
+
+        Arguments:
+            desc: description of the transaction, for logging and metrics
+            func: callback function, which will be called with a
+                database transaction (twisted.enterprise.adbapi.Transaction) as
+                its first argument, followed by `args` and `kwargs`.
+
+            db_autocommit: Whether to run the function in "autocommit" mode,
+                i.e. outside of a transaction. This is useful for transactions
+                that are only a single query.
+
+                Currently, this is only implemented for Postgres. SQLite will still
+                run the function inside a transaction.
+
+                WARNING: This means that if func fails half way through then
+                the changes will *not* be rolled back. `func` may also get
+                called multiple times if the transaction is retried, so must
+                correctly handle that case.
+
+            isolation_level: Set the server isolation level for this transaction.
+            args: positional args to pass to `func`
+            kwargs: named args to pass to `func`
+
+        Returns:
+            The result of func
+        """
+
+        async def _runInteraction() -> R:
+            after_callbacks: list[_CallbackListEntry] = []
+            async_after_callbacks: list[_AsyncCallbackListEntry] = []
+            exception_callbacks: list[_CallbackListEntry] = []
+
+            if not current_context():
+                logger.warning("Starting db txn '%s' from sentinel context", desc)
+
+            try:
+                with opentracing.start_active_span(f"db.{desc}"):
+                    result: R = await self.runWithConnection(
+                        # mypy seems to have an issue with this, maybe a bug?
+                        self.new_transaction,
+                        desc,
+                        after_callbacks,
+                        async_after_callbacks,
+                        exception_callbacks,
+                        func,
+                        *args,
+                        db_autocommit=db_autocommit,
+                        isolation_level=isolation_level,
+                        **kwargs,
+                    )
+
+                # We order these assuming that async functions call out to external
+                # systems (e.g. to invalidate a cache) and the sync functions make these
+                # changes on any local in-memory caches/similar, and thus must be second.
+                for async_callback, async_args, async_kwargs in async_after_callbacks:
+                    await async_callback(*async_args, **async_kwargs)
+                for after_callback, after_args, after_kwargs in after_callbacks:
+                    after_callback(*after_args, **after_kwargs)
+                return result
+            except Exception:
+                for exception_callback, after_args, after_kwargs in exception_callbacks:
+                    exception_callback(*after_args, **after_kwargs)
+                raise
+
+        # To handle cancellation, we ensure that `after_callback`s and
+        # `exception_callback`s are always run, since the transaction will complete
+        # on another thread regardless of cancellation.
+        #
+        # We also wait until everything above is done before releasing the
+        # `CancelledError`, so that logging contexts won't get used after they have been
+        # finished.
+        return await delay_cancellation(_runInteraction())
+
+    async def runWithConnection(
+        self,
+        func: Callable[Concatenate[LoggingDatabaseConnection, P], R],
+        *args: Any,
+        db_autocommit: bool = False,
+        isolation_level: IsolationLevel | None = None,
+        **kwargs: Any,
+    ) -> R:
+        """Wraps the .runWithConnection() method on the underlying db_pool.
+
+        Arguments:
+            func: callback function, which will be called with a
+                database connection (twisted.enterprise.adbapi.Connection) as
+                its first argument, followed by `args` and `kwargs`.
+            args: positional args to pass to `func`
+            db_autocommit: Whether to run the function in "autocommit" mode,
+                i.e. outside of a transaction. This is useful for transaction
+                that are only a single query. Currently only affects postgres.
+            isolation_level: Set the server isolation level for this transaction.
+            kwargs: named args to pass to `func`
+
+        Returns:
+            The result of func
+        """
+        curr_context = current_context()
+        if not curr_context:
+            logger.warning(
+                "Starting db connection from sentinel context: metrics will be lost"
+            )
+            parent_context = None
+        else:
+            assert isinstance(curr_context, LoggingContext)
+            parent_context = curr_context
+
+        start_time = monotonic_time()
+
+        def inner_func(conn: _PoolConnection, *args: P.args, **kwargs: P.kwargs) -> R:
+            # We shouldn't be in a transaction. If we are then something
+            # somewhere hasn't committed after doing work. (This is likely only
+            # possible during startup, as `run*` will ensure changes are
+            # committed/rolled back before putting the connection back in the
+            # pool).
+            assert not self.engine.in_transaction(conn)
+
+            with LoggingContext(
+                name=str(curr_context),
+                server_name=self.server_name,
+                parent_context=parent_context,
+            ) as context:
+                with opentracing.start_active_span(
+                    operation_name="db.connection",
+                ):
+                    sched_duration_sec = monotonic_time() - start_time
+                    sql_scheduling_timer.labels(
+                        **{SERVER_NAME_LABEL: self.server_name}
+                    ).observe(sched_duration_sec)
+                    context.add_database_scheduled(sched_duration_sec)
+
+                    if self._txn_limit > 0:
+                        tid = self._db_pool.threadID()
+                        self._txn_counters[tid] += 1
+
+                        if self._txn_counters[tid] > self._txn_limit:
+                            logger.debug(
+                                "Reconnecting database connection over transaction limit"
+                            )
+                            conn.reconnect()
+                            opentracing.log_kv(
+                                {"message": "reconnected due to txn limit"}
+                            )
+                            self._txn_counters[tid] = 1
+
+                    if self.engine.is_connection_closed(conn):
+                        logger.debug("Reconnecting closed database connection")
+                        conn.reconnect()
+                        opentracing.log_kv({"message": "reconnected"})
+                        if self._txn_limit > 0:
+                            self._txn_counters[tid] = 1
+
+                    try:
+                        if db_autocommit:
+                            self.engine.attempt_to_set_autocommit(conn, True)
+                        if isolation_level is not None:
+                            self.engine.attempt_to_set_isolation_level(
+                                conn, isolation_level
+                            )
+
+                        db_conn = LoggingDatabaseConnection(
+                            conn=conn,
+                            engine=self.engine,
+                            default_txn_name="runWithConnection",
+                            server_name=self.server_name,
+                        )
+                        return func(db_conn, *args, **kwargs)
+                    finally:
+                        if db_autocommit:
+                            self.engine.attempt_to_set_autocommit(conn, False)
+                        if isolation_level:
+                            self.engine.attempt_to_set_isolation_level(conn, None)
+
+        return await make_deferred_yieldable(
+            self._db_pool.runWithConnection(inner_func, *args, **kwargs)
+        )
+
+
+def create_database_pool_class(
+    hs: "HomeServer",
+    database_config: DatabaseConnectionConfig,
+    engine: BaseDatabaseEngine,
+) -> DatabasePool:
+    return TwistedDatabasePool(hs, database_config, engine)
 
 
 def make_in_list_sql_clause(
