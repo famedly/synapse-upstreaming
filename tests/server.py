@@ -1123,23 +1123,21 @@ def setup_test_homeserver(
     if USE_POSTGRES_FOR_TESTS:
         test_db = "synapse_test_%s" % uuid.uuid4().hex
 
-        if USE_POSTGRES_FOR_TESTS == "psycopg":
-            db_type = "psycopg"
-        else:
-            db_type = "psycopg2"
-
         database_config: JsonDict = {
-            "name": db_type,
             "args": {
                 "dbname": test_db,
                 "host": POSTGRES_HOST,
                 "password": POSTGRES_PASSWORD,
                 "user": POSTGRES_USER,
                 "port": POSTGRES_PORT,
-                "cp_min": 1,
-                "cp_max": 5,
             },
         }
+        if USE_POSTGRES_FOR_TESTS == "psycopg":
+            database_config.update({"name": "psycopg"})
+
+        else:
+            database_config.update({"name": "psycopg2"})
+            database_config["args"].update({"cp_min": 1, "cp_max": 5})
     else:
         if SQLITE_PERSIST_DB:
             # The current working directory is in _trial_temp, so this gets created within that directory.
