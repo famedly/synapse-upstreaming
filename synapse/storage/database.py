@@ -280,7 +280,7 @@ def make_conn(
     db_params = {
         k: v
         for k, v in db_config.config.get("args", {}).items()
-        if not k.startswith("cp_")
+        if not (k.startswith("cp_") or k in psycopg_pool_setting_names_to_exclude)
     }
     native_db_conn = engine.module.connect(**db_params)
     db_conn = LoggingDatabaseConnection(
