@@ -1137,6 +1137,9 @@ def setup_test_homeserver(
         }
         if USE_POSTGRES_FOR_TESTS == "psycopg":
             database_config.update({"name": "psycopg"})
+            database_config["args"].update(
+                {"min_size": 1, "max_size": 5, "timeout": 5.0}
+            )
 
         else:
             database_config.update({"name": "psycopg2"})

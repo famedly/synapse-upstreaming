@@ -199,6 +199,13 @@ def make_twisted_pool(
     return connection_pool
 
 
+psycopg_pool_setting_names_to_exclude = {
+    "min_size",
+    "max_size",
+    "timeout",
+}
+
+
 def make_psycopg_pool(
     *,
     reactor: IReactorCore,
@@ -211,6 +218,16 @@ def make_psycopg_pool(
 
     db_args = dict(db_config.config.get("args", {}))
     # TODO: clean these, the twisted pool and this one do not share compatible options
+    conn_args = {
+        key: value
+        for key, value in db_args.items()
+        if key not in psycopg_pool_setting_names_to_exclude
+    }
+    pool_args = {
+        key: value
+        for key, value in db_args.items()
+        if key in psycopg_pool_setting_names_to_exclude
+    }
 
     def _on_new_connection(conn: psycopg.Connection[Any]) -> None:
         # Ensure we have a logging context so we can correctly track queries,
@@ -228,7 +245,12 @@ def make_psycopg_pool(
     connection_pool = psycopg_pool.ConnectionPool(
         "",
         configure=_on_new_connection,
-        kwargs=db_args,
+        # Using open=True on the creation of the class is considered deprecated, but
+        # still functions for now. Later, will have to change to calling Class.open()
+        # when the database is required to be open expressly.
+        open=True,
+        kwargs=conn_args,
+        **pool_args,
     )
 
     # Not sure we can access the thread pool inside the psycopg connection pool. It is
