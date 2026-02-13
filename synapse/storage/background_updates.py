@@ -36,6 +36,8 @@ from typing import (
 import attr
 from pydantic import BaseModel
 
+from twisted.internet.defer import CancelledError
+
 from synapse.storage.engines import PostgresEngine
 from synapse.storage.types import Connection, Cursor
 from synapse.types import JsonDict, StrCollection
@@ -421,6 +423,11 @@ class BackgroundUpdater:
                 try:
                     result = await self.do_next_background_update(sleep)
                     back_to_back_failures = 0
+                except CancelledError:
+                    logger.warning(
+                        "Background update was cancelled. Probably a shutdown of the system?"
+                    )
+                    return None
                 except Exception as e:
                     logger.exception("Error doing update: %s", e)
                     back_to_back_failures += 1

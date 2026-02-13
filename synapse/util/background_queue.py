@@ -124,11 +124,17 @@ class BackgroundQueue(Generic[T]):
                 # data immediately even though there isn't. That's fine, we'll
                 # just loop round, clear the event, recheck the queue, and then
                 # wait here again.
-                new_data = await self._wakeup_event.wait(
-                    timeout_seconds=self._timeout_ms.as_secs()
-                )
-                if not new_data:
-                    # Timed out waiting for new data, so exit the loop
+                try:
+                    new_data = await self._wakeup_event.wait(
+                        timeout_seconds=self._timeout_ms.as_secs()
+                    )
+                    if not new_data:
+                        # Timed out waiting for new data, so exit the loop
+                        break
+                except defer.CancelledError:
+                    logger.warning(
+                        "BackgroundQueue was interrupted while waiting for event. Is this a shutdown?"
+                    )
                     break
         finally:
             # This background process is exiting, so clear the wakeup event to
