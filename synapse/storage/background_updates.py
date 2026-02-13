@@ -750,7 +750,7 @@ class BackgroundUpdater:
             )
 
             logger.info("Validating constraint %s to %s", constraint_name, table)
-            await self.db_pool.runWithConnection(runner)
+            await self.db_pool.runWithConnection(runner, db_autocommit=True)
             await self._end_background_update(update_name)
             return 1
 
