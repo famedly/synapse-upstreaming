@@ -19,14 +19,18 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+import contextvars
 import functools
 import gc
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import secrets
 import time
+import warnings
+from asyncio import Runner
 from typing import (
     AbstractSet,
     Any,
@@ -317,6 +321,146 @@ class TestCase(unittest.TestCase):
         diff_message = f"{first_message}\n{expected_string}\n{actual_string}"
 
         self.fail(f"{diff_message}\n{message}")
+
+
+class AsyncLoopTestCaseMixin(TestCase):
+    """
+    A mixin class for the overridden Twisted TestCase that adds in support to have
+    localized asyncio event loop for individual tests. The prime motivation for this is
+    to support psycopg's connection pool needing access to the get_event_loop() call.
+
+    Most of this code is lifted from the stdlib unittest.IsolatedAsyncioTestCase
+    """
+
+    def __init__(self, methodName: str) -> None:
+        super().__init__(methodName)
+        self._asyncioRunner: Runner | None = None
+        # It's possible that contextvars could give us trouble, especially around spans
+        self._asyncioTestContext = contextvars.copy_context()
+
+    async def asyncSetUp(self) -> None:
+        pass
+
+    async def asyncTearDown(self) -> None:
+        pass
+
+    def addAsyncCleanup(
+        self, func: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> None:
+        # A trivial trampoline to addCleanup()
+        # the function exists because it has a different semantics
+        # and signature:
+        # addCleanup() accepts regular functions
+        # but addAsyncCleanup() accepts coroutines
+        #
+        # We intentionally don't add inspect.iscoroutinefunction() check
+        # for func argument because there is no way
+        # to check for async function reliably:
+        # 1. It can be "async def func()" itself
+        # 2. Class can implement "async def __call__()" method
+        # 3. Regular "def func()" that returns awaitable object
+        self.addCleanup(*(func, *args), **kwargs)
+
+    # Unclear if this is needed/used
+    # async def enterAsyncContext(self, cm):
+    #     """Enters the supplied asynchronous context manager.
+    #
+    #     If successful, also adds its __aexit__ method as a cleanup
+    #     function and returns the result of the __aenter__ method.
+    #     """
+    #     # We look up the special methods on the type to match the with
+    #     # statement.
+    #     cls = type(cm)
+    #     try:
+    #         enter = cls.__aenter__
+    #         exit = cls.__aexit__
+    #     except AttributeError:
+    #         raise TypeError(f"'{cls.__module__}.{cls.__qualname__}' object does "
+    #                         f"not support the asynchronous context manager protocol"
+    #                        ) from None
+    #     result = await enter(cm)
+    #     self.addAsyncCleanup(exit, cm, None, None, None)
+    #     return result
+
+    def _callSetUp(self) -> None:
+        # Force loop to be initialized and set as the current loop
+        # so that setUp functions can use get_event_loop() and get the
+        # correct loop instance.
+        assert self._asyncioRunner is not None, (
+            "asyncio runner not instantiated(J added error)"
+        )
+        self._asyncioRunner.get_loop()
+        self._asyncioTestContext.run(self.setUp)
+        self._callAsync(self.asyncSetUp)
+
+    def _callTestMethod(self, method: Callable[..., Any]) -> None:
+        if self._callMaybeAsync(method) is not None:
+            warnings.warn(
+                f"It is deprecated to return a value that is not None from a "
+                f"test case ({method})",
+                DeprecationWarning,
+                stacklevel=4,
+            )
+
+    def _callTearDown(self) -> None:
+        self._callAsync(self.asyncTearDown)
+        self._asyncioTestContext.run(self.tearDown)
+
+    def _callCleanup(
+        self, function: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> None:
+        self._callMaybeAsync(function, *args, **kwargs)
+
+    def _callAsync(
+        self, func: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> None:
+        assert self._asyncioRunner is not None, "asyncio runner is not initialized"
+        assert inspect.iscoroutinefunction(func), f"{func!r} is not an async function"
+        return self._asyncioRunner.run(
+            func(*args, **kwargs), context=self._asyncioTestContext
+        )
+
+    def _callMaybeAsync(
+        self, func: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> None:
+        assert self._asyncioRunner is not None, "asyncio runner is not initialized"
+        if inspect.iscoroutinefunction(func):
+            return self._asyncioRunner.run(
+                func(*args, **kwargs),
+                context=self._asyncioTestContext,
+            )
+        else:
+            return self._asyncioTestContext.run(func, *args, **kwargs)
+
+    def _setupAsyncioRunner(self) -> None:
+        assert self._asyncioRunner is None, "asyncio runner is already initialized"
+        # Python 3.12 added a kwarg to Runner to supply a loop making factory. I imagine
+        # we will never use this and instead it will use the default event loop
+        runner = Runner(debug=True)
+        self._asyncioRunner = runner
+
+    def _tearDownAsyncioRunner(self) -> None:
+        assert self._asyncioRunner is not None, (
+            "asyncio runner not instantiated(J added error)"
+        )
+        runner = self._asyncioRunner
+        runner.close()
+
+    def run(self, result: R | None = None) -> R | None:
+        self._setupAsyncioRunner()
+        try:
+            return super().run(result)
+        finally:
+            self._tearDownAsyncioRunner()
+
+    def debug(self) -> None:
+        self._setupAsyncioRunner()
+        super().debug()
+        self._tearDownAsyncioRunner()
+
+    def __del__(self) -> None:
+        if self._asyncioRunner is not None:
+            self._tearDownAsyncioRunner()
 
 
 def DEBUG(target: TV) -> TV:
