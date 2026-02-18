@@ -79,13 +79,16 @@ class WorkerSchemaTests(HomeserverTestCase):
         context manager pattern to ensure closing the connection after.
         """
         if isinstance(db_pool, PsycopgDatabasePool):
-            with db_pool._db_pool.connection() as conn:
-                yield LoggingDatabaseConnection(
-                    conn=conn,
-                    engine=db_pool.engine,
-                    default_txn_name="tests",
-                    server_name="test_server",
-                )
+            conn = self.get_success_or_raise(db_pool._db_pool.connection().__aenter__())
+            yield LoggingDatabaseConnection(
+                conn=conn,
+                engine=db_pool.engine,
+                default_txn_name="tests",
+                server_name="test_server",
+            )
+            self.get_success_or_raise(
+                db_pool._db_pool.connection().__aexit__(None, None, None)
+            )
         else:
             assert isinstance(db_pool, TwistedDatabasePool)
             db_conn = LoggingDatabaseConnection(
