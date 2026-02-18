@@ -19,12 +19,13 @@
 #
 #
 import json
-from contextlib import contextmanager
-from typing import Generator
+from contextlib import asynccontextmanager, contextmanager
+from typing import AsyncGenerator, Generator
 from unittest import mock
 
 import psycopg
 import psycopg_pool
+
 from twisted.enterprise.adbapi import ConnectionPool
 from twisted.internet.defer import CancelledError, Deferred, ensureDeferred
 from twisted.internet.testing import MemoryReactor
@@ -441,8 +442,8 @@ class DatabaseOutageTestCase(unittest.HomeserverTestCase):
             # Restore the test data.
             self._populate_events()
 
-    @contextmanager
-    def _outage_psycopg(self) -> Generator[None, None, None]:
+    @asynccontextmanager
+    async def _outage_psycopg(self) -> AsyncGenerator[None, None]:
         """Simulate a database outage.
 
         Returns:
@@ -450,7 +451,7 @@ class DatabaseOutageTestCase(unittest.HomeserverTestCase):
             the database will fail.
         """
         connection_pool = self.store.db_pool._db_pool
-        assert isinstance(connection_pool, psycopg_pool.ConnectionPool)
+        assert isinstance(connection_pool, psycopg_pool.AsyncConnectionPool)
         # Close all connections and shut down the database `ThreadPool`.
         # connection_pool.close(timeout=0.1)
 
@@ -458,7 +459,15 @@ class DatabaseOutageTestCase(unittest.HomeserverTestCase):
         # connection_pool._closed = False
         # connection_pool._opened = False
         # maybe call open() here before setting the exception class?
-        connection_patcher = mock.patch.object(connection_pool, "_getconn_with_check_loop", mock.Mock(side_effect=psycopg.OperationalError("Could not connect to the database.")))
+        connection_patcher = mock.patch.object(
+            connection_pool,
+            "_getconn_with_check_loop",
+            mock.Mock(
+                side_effect=psycopg.OperationalError(
+                    "Could not connect to the database."
+                )
+            ),
+        )
         connection_patcher.start()
         # connection_pool.open(wait=True, timeout=5.0)
         # original_connection_factory = connection_pool._getconn_with_check_loop
@@ -473,21 +482,23 @@ class DatabaseOutageTestCase(unittest.HomeserverTestCase):
             # connection_pool._getconn_with_check_loop = original_connection_factory
             connection_patcher.stop()
             # essentially closes all active connections and resets them
-            connection_pool.drain()
+            await connection_pool.drain()
             # If the in-memory SQLite database is being used, all the events are gone.
             # Restore the test data.
             self._populate_events()
 
     @contextmanager
     def _outage(self) -> Generator[None, None, None]:
-        if isinstance(self.store.db_pool._db_pool, psycopg_pool.ConnectionPool):
-            outage_func = self._outage_psycopg
-        else:
-            outage_func = self._outage_twisted
-
-        with outage_func():
+        if isinstance(self.store.db_pool._db_pool, psycopg_pool.AsyncConnectionPool):
+            self.get_success_or_raise(self._outage_psycopg().__aenter__())
             yield
-
+            self.get_success_or_raise(
+                self._outage_psycopg().__aexit__(None, None, None)
+            )
+        else:
+            self._outage_twisted().__enter__()
+            yield
+            self._outage_twisted().__exit__(None, None, None)
 
     def test_failure(self) -> None:
         """Test that event fetches do not get stuck during a database outage."""
