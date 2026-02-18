@@ -48,7 +48,9 @@ def setup_logging() -> None:
 
     # We exclude `%(asctime)s` from this format because the Twisted logger adds its own
     # timestamp
-    log_format = "%(name)s - %(lineno)d - %(levelname)s - %(request)s - %(message)s"
+    log_format = (
+        "%(asctime)s: %(name)s - %(lineno)d - %(levelname)s - %(request)s - %(message)s"
+    )
 
     handler = ToTwistedHandler()
     formatter = logging.Formatter(log_format)
@@ -69,6 +71,10 @@ def setup_logging() -> None:
         logging.getLogger("synapse.visibility.filtered_event_debug").setLevel(
             logging.DEBUG
         )
+    if root_logger.isEnabledFor(logging.DEBUG):
+        logging.getLogger("synapse.logging.context.debug").setLevel(logging.DEBUG)
+        logging.getLogger("psycopg").setLevel(logging.DEBUG)
+        logging.getLogger("psycopg.pool").setLevel(logging.DEBUG)
 
     # Blow away the pyo3-log cache so that it reloads the configuration.
     reset_logging_config()
