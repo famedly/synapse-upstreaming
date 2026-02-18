@@ -670,6 +670,8 @@ async def start(hs: "HomeServer", *, freeze: bool = True) -> None:
     """
     server_name = hs.hostname
     reactor = hs.get_reactor()
+    for db in hs.get_datastores().databases:
+        await db.open()
 
     # We want to use a separate thread pool for the resolver so that large
     # numbers of DNS requests don't starve out other users of the threadpool.
