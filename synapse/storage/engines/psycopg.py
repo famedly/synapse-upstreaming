@@ -93,7 +93,7 @@ class PsycopgEngine(
         # it because it doesn't support __setattr__.
         if isinstance(conn, TxConnection):
             conn = conn._connection
-        conn.autocommit = autocommit
+        conn.set_autocommit(autocommit)
 
     def attempt_to_set_isolation_level(
         self, conn: psycopg.Connection, isolation_level: IsolationLevel | None = None
@@ -102,4 +102,4 @@ class PsycopgEngine(
             pg_isolation_level = self.default_isolation_level
         else:
             pg_isolation_level = self.isolation_level_map[isolation_level]
-        conn.isolation_level = pg_isolation_level
+        conn.set_isolation_level(pg_isolation_level)

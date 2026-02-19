@@ -19,6 +19,7 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+import asyncio
 import contextvars
 import functools
 import gc
@@ -29,7 +30,6 @@ import json
 import logging
 import secrets
 import time
-import warnings
 from asyncio import Runner
 from typing import (
     AbstractSet,
@@ -45,6 +45,7 @@ from typing import (
     Protocol,
     TypeVar,
 )
+from unittest import SkipTest, TestResult
 from unittest.mock import Mock, patch
 
 import canonicaljson
@@ -54,6 +55,7 @@ from typing_extensions import Concatenate, ParamSpec
 
 from twisted.internet.defer import Deferred, ensureDeferred
 from twisted.internet.testing import MemoryReactor, MemoryReactorClock
+from twisted.python import failure
 from twisted.python.failure import Failure
 from twisted.python.threadpool import ThreadPool
 from twisted.trial import unittest
@@ -72,7 +74,6 @@ from synapse.http.server import JsonResource, OptionsResource
 from synapse.http.site import SynapseRequest, SynapseSite
 from synapse.logging.context import (
     SENTINEL_CONTEXT,
-    LoggingContext,
     current_context,
     set_current_context,
 )
@@ -90,6 +91,7 @@ from tests.server import (
     get_clock,
     make_request,
     setup_test_homeserver,
+    start_test_homeserver,
 )
 from tests.test_utils import event_injection, setup_awaitable_errors
 from tests.test_utils.logging_setup import setup_logging
@@ -339,9 +341,12 @@ class AsyncLoopTestCaseMixin(TestCase):
         self._asyncioTestContext = contextvars.copy_context()
 
     async def asyncSetUp(self) -> None:
-        pass
+        logger.warning("JASON: calling asyncSetup")
 
     async def asyncTearDown(self) -> None:
+        logger.warning("JASON: calling asyncTearDown")
+
+    def afterSetUp(self) -> None:
         pass
 
     def addAsyncCleanup(
@@ -382,29 +387,110 @@ class AsyncLoopTestCaseMixin(TestCase):
     #     self.addAsyncCleanup(exit, cm, None, None, None)
     #     return result
 
-    def _callSetUp(self) -> None:
-        # Force loop to be initialized and set as the current loop
-        # so that setUp functions can use get_event_loop() and get the
-        # correct loop instance.
-        assert self._asyncioRunner is not None, (
-            "asyncio runner not instantiated(J added error)"
-        )
-        self._asyncioRunner.get_loop()
-        self._asyncioTestContext.run(self.setUp)
-        self._callAsync(self.asyncSetUp)
+    async def _deferSetUp(self, result: TestResult) -> None:
+        """
+        From Twisted, we will borrow this as a hook to run the additional functions
+        needed for asyncio event loop set up and use
 
-    def _callTestMethod(self, method: Callable[..., Any]) -> None:
-        if self._callMaybeAsync(method) is not None:
-            warnings.warn(
-                f"It is deprecated to return a value that is not None from a "
-                f"test case ({method})",
-                DeprecationWarning,
-                stacklevel=4,
+        Args:
+            result: Not completely sure what type this actually is. It has an Interface
+                for itrial.IReporter but is also probably a TestResult from stdlib unittest
+        """
+        try:
+            try:
+                logger.warning("JASON: Calling _deferSetUp")
+                # This will call setUp() and asyncSetUp() then will run the test
+                await self._deferSetUpAndRun(result)
+
+            finally:
+                # don't need to do the wrap in context thing here, as our local version
+                # of _run() gets called which does it for us
+                await self._deferRunCleanups(result)
+        finally:
+            if self._twistedPrivateNeedsTearDown:
+                await self._deferTearDown(result)
+
+    async def _deferSetUpAndRun(self, result: TestResult) -> None:
+        """
+        Execute the setUp and run part of a test. Teardown and cleanups are not executed.
+
+        Lifted from Twisted's async TestCase to allow running the asyncSetUp and
+        asyncTearDown methods
+        """
+        try:
+            logger.warning("JASON: Calling _deferSetUpAndRun")
+            assert self._asyncioRunner is not None, (
+                "asyncio runner not instantiated(J added error)"
             )
+            self._asyncioRunner.get_loop()
 
-    def _callTearDown(self) -> None:
-        self._callAsync(self.asyncTearDown)
-        self._asyncioTestContext.run(self.tearDown)
+            await self._run(self.setUp, "setUp", result)
+            # async def setup_d() -> None:
+            #     return await self.asyncSetUp()
+
+            # setup_d = Deferred.fromCoroutine(self.asyncSetUp())
+            await self._run(self.asyncSetUp, "asyncSetUp", result)
+            await self._run(self.afterSetUp, "prepare", result)
+
+        except SkipTest as e:
+            result.addSkip(self, self._getSkipReason(self.setUp, e))
+            return
+        except KeyboardInterrupt as e:
+            result.addError(self, failure.Failure(e))  # type: ignore[arg-type]
+            result.stop()
+            return
+        except BaseException as e:
+            result.addError(self, failure.Failure(e))  # type: ignore[arg-type]
+            return
+
+        self._twistedPrivateNeedsTearDown = True
+
+        try:
+            await self._run(
+                getattr(self, self._testMethodName), self._testMethodName, result
+            )
+            if self.getTodo() is not None:
+                result.addUnexpectedSuccess(self, self.getTodo())  # type: ignore[call-arg]
+            else:
+                self._passed = True
+        except BaseException as e:
+            self._ebDeferTestMethod(failure.Failure(e), result)
+            raise
+
+    # def _callSetUp(self) -> None:
+    #     # XXX: Stuffed this into _deferSetUp()
+    #     # Force loop to be initialized and set as the current loop
+    #     # so that setUp functions can use get_event_loop() and get the
+    #     # correct loop instance.
+    #     logger.warning("JASON: Calling _callSetUp")
+    #     assert self._asyncioRunner is not None, (
+    #         "asyncio runner not instantiated(J added error)"
+    #     )
+    #     self._asyncioRunner.get_loop()
+    #     self._asyncioTestContext.run(self.setUp)
+    #     self._callAsync(self.asyncSetUp)
+
+    # def _callTestMethod(self, method: Callable[..., Any]) -> None:
+    # Overrode this in _run() which is from twisted. It will maintain context there
+    # if self._callMaybeAsync(method) is not None:
+    #     warnings.warn(
+    #         f"It is deprecated to return a value that is not None from a "
+    #         f"test case ({method})",
+    #         DeprecationWarning,
+    #         stacklevel=4,
+    #     )
+
+    async def _deferTearDown(self, result: TestResult) -> None:
+        try:
+            await self._run(self.tearDown, "tearDown", result)
+            await self._run(self.asyncTearDown, "asyncTearDown", result)
+        except KeyboardInterrupt as e:
+            result.addError(self, failure.Failure(e))  # type: ignore[arg-type]
+            result.stop()
+            self._passed = False
+        except BaseException as e:
+            result.addError(self, failure.Failure(e))  # type: ignore[arg-type]
+            self._passed = False
 
     def _callCleanup(
         self, function: Callable[..., Any], *args: Any, **kwargs: Any
@@ -430,12 +516,13 @@ class AsyncLoopTestCaseMixin(TestCase):
                 context=self._asyncioTestContext,
             )
         else:
+            # assert isinstance(func, defer.Deferred), f"{func!r} is not a deferred"
             return self._asyncioTestContext.run(func, *args, **kwargs)
 
     def _setupAsyncioRunner(self) -> None:
         assert self._asyncioRunner is None, "asyncio runner is already initialized"
         # Python 3.12 added a kwarg to Runner to supply a loop making factory. I imagine
-        # we will never use this and instead it will use the default event loop
+        # we will never use this; instead it will use the default event loop
         runner = Runner(debug=True)
         self._asyncioRunner = runner
 
@@ -446,12 +533,22 @@ class AsyncLoopTestCaseMixin(TestCase):
         runner = self._asyncioRunner
         runner.close()
 
-    def run(self, result: R | None = None) -> R | None:
+    def run(self, result: TestResult | None = None) -> R | None:
+        # This is the entry point for a given test/testcase
         self._setupAsyncioRunner()
         try:
             return super().run(result)
         finally:
             self._tearDownAsyncioRunner()
+
+    # mypy thinks the signature doesn't match the superclass. Technically, it's correct.
+    # The Twisted async TestCase has the signature below, but it's base class has
+    # something completely different. We use the former
+    async def _run(
+        self, func: Callable[..., Any], funcDescription: str, result: TestResult
+    ) -> None:  # type: ignore[override]
+        # Wrap the superclasses _run() so the context and event loop are maintained
+        self._callMaybeAsync(super()._run, func, funcDescription, result)
 
     def debug(self) -> None:
         self._setupAsyncioRunner()
@@ -493,7 +590,7 @@ def logcontext_clean(target: TV) -> TV:
     return patcher(target)  # type: ignore[call-overload]
 
 
-class HomeserverTestCase(TestCase):
+class HomeserverTestCase(AsyncLoopTestCaseMixin):
     """
     A base TestCase that reduces boilerplate for HomeServer-using test cases.
 
@@ -536,12 +633,14 @@ class HomeserverTestCase(TestCase):
         hijacking the authentication system to return a fixed user, and then
         calling the prepare function.
         """
+        # super().setUp()
+        logger.warning("JASON: calling setUp()")
         # We need to share the reactor between the homeserver and all of our test utils.
         self.reactor, self.clock = get_clock()
         self.hs = self.make_homeserver(self.reactor, self.clock)
 
         self.hs.get_datastores().main.tests_allow_no_chain_cover_index = False
-
+        # self.wait_on_thread(defer.ensureDeferred(self.hs.get_datastores().databases[0].open()))
         # Honour the `use_frozen_dicts` config option. We have to do this
         # manually because this is taken care of in the app `start` code, which
         # we don't run. Plus we want to reset it on tearDown.
@@ -610,24 +709,50 @@ class HomeserverTestCase(TestCase):
             self.reactor.threadpool = ThreadPool()  # type: ignore[assignment]
             self.addCleanup(self.reactor.threadpool.stop)
             self.reactor.threadpool.start()
+        logger.warning("JASON: Finishing setUp()")
+
+    def afterSetUp(self) -> None:
+        logger.warning("JASON: calling afterSetUp()")
+        start_test_homeserver(
+            hs=self.hs, cleanup_func=self.addCleanup, reactor=self.hs.get_reactor()
+        )
 
         if hasattr(self, "prepare"):
             self.prepare(self.reactor, self.clock, self.hs)
 
+    async def asyncSetUp(self) -> None:
+        logger.warning("JASON: calling asyncSetUp")
+        store = self.hs.get_datastores().main
+        # with LoggingContext(name="opening_db_pool", server_name=self.hs.config.server.server_name):
+        # XXX: this bit of strangeness is what allows the database pool to actually
+        #  start. Since the primary event loop is still Twisted, wrapping the coroutine
+        #  into a future and *then* making it into a Deferred seems to be the only way
+        #  found to allow it to run while having the asyncio event loop handy. I only
+        #  hope that this is not going to be needed invasively all over the place.
+        self.wait_on_thread(
+            Deferred.fromFuture(asyncio.ensure_future(store.db_pool.open()))
+        )
+        # with LoggingContext(name="run_bg_updates", server_name=self.hs.config.server.server_name):
+        #     await store.db_pool.updates.run_background_updates(False)
+        logger.warning("JASON: finished asyncSetUp")
+
     def tearDown(self) -> None:
         # Reset to not use frozen dicts.
         events.USE_FROZEN_DICTS = False
+        super().tearDown()
 
     def wait_on_thread(self, deferred: Deferred, timeout: int = 10) -> None:
         """
         Wait until a Deferred is done, where it's waiting on a real thread.
         """
         start_time = time.time()
-
+        logger.info("JASON: wait_on_thread: start_time: %r", start_time)
         while not deferred.called:
             if start_time + timeout < time.time():
                 raise ValueError("Timed out waiting for threadpool")
+            logger.info("JASON: wait_on_thread: advancing reactor")
             self.reactor.advance(0.01)
+            logger.info("JASON: wait_on_thread: sleeping time()")
             time.sleep(0.01)
 
     def wait_for_background_updates(self) -> None:
@@ -656,6 +781,7 @@ class HomeserverTestCase(TestCase):
         Function to be overridden in subclasses.
         """
         hs = self.setup_test_homeserver(reactor=reactor, clock=clock)
+        # reactor.run()
         return hs
 
     def create_test_resource(self) -> Resource:
@@ -819,9 +945,9 @@ class HomeserverTestCase(TestCase):
         # construct a homeserver with a matching name.
         server_name = config_obj.server.server_name
 
-        async def run_bg_updates() -> None:
-            with LoggingContext(name="run_bg_updates", server_name=server_name):
-                await stor.db_pool.updates.run_background_updates(False)
+        # async def run_bg_updates() -> None:
+        #     with LoggingContext(name="run_bg_updates", server_name=server_name):
+        #         await stor.db_pool.updates.run_background_updates(False)
 
         hs = setup_test_homeserver(
             cleanup_func=self.addCleanup,
@@ -831,11 +957,14 @@ class HomeserverTestCase(TestCase):
             clock=clock,
             **extra_homeserver_attributes,
         )
-        stor = hs.get_datastores().main
+        # The homeserver will be created, but not started yet. Remember to run start_home_server
+        # for db in hs.get_datastores().databases:
+        #     self.wait_on_thread(ensureDeferred(db.open()))
+        # stor = hs.get_datastores().main
 
         # Run the database background updates, when running against "master".
-        if hs.__class__.__name__ == "TestHomeServer":
-            self.get_success(run_bg_updates())
+        # if hs.__class__.__name__ == "TestHomeServer":
+        #     self.get_success(run_bg_updates())
 
         return hs
 

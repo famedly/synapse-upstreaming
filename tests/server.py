@@ -18,6 +18,7 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+import asyncio
 import hashlib
 import ipaddress
 import json
@@ -56,7 +57,12 @@ from twisted.enterprise import adbapi
 from twisted.internet import address, defer, tcp, threads, udp
 from twisted.internet._resolver import SimpleResolverComplexifier
 from twisted.internet.address import IPv4Address, IPv6Address
-from twisted.internet.defer import Deferred, fail, maybeDeferred, succeed
+from twisted.internet.defer import (
+    Deferred,
+    fail,
+    maybeDeferred,
+    succeed,
+)
 from twisted.internet.error import DNSLookupError
 from twisted.internet.interfaces import (
     IAddress,
@@ -527,10 +533,24 @@ class ThreadedMemoryReactorClock(MemoryReactorClock):
 
         super().__init__()
 
+        # asyncio uses time.monotonic() to monitor time passing and what to run. Patch it to
+        # use the fake time supplied by the Clock before the event loop is acquired
+        self._time_patcher = patch.object(time, "monotonic", return_value=self.rightNow)
+        self._time_patcher.start()
+
         # Override the default name resolver with our fake resolver. This must
         # happen after `super().__init__()` so that the base class doesn't
         # overwrite it again.
         self.nameResolver = SimpleResolverComplexifier(FakeResolver())
+
+        # To support a psycopg database connection pool in async mode, there needs to
+        # be an active, running, event loop for it to acquire. For a normal Synapse
+        # setup, this need would be fulfilled by the AsyncioSelectorReactor. Unit tests
+        # are not run with such a setup. This seems to be enough.
+        # The rest of the AsyncioSelectorReactor should not be necessary at this time.
+        # self._originalLoopPolicy = asyncio.get_event_loop_policy()
+        # self._asyncioEventLoop = self._originalLoopPolicy.new_event_loop()
+        self._asyncioEventLoop = asyncio.get_event_loop()
 
     def run(self) -> None:
         """
@@ -539,11 +559,18 @@ class ThreadedMemoryReactorClock(MemoryReactorClock):
         This is necessary for a clean shutdown to occur as these hooks can hold
         references to the `SynapseHomeServer`.
         """
+        logger.warning("JASON: reactor: calling run()")
         super().run()
-
+        logger.warning("Calling to start the event loop")
+        self._asyncioEventLoop.run_forever()
         # `MemoryReactorClock` never clears the hooks that have already been called.
         # So manually clear the hooks here after they have been run.
         self.whenRunningHooks.clear()
+
+    def stop(self) -> None:
+        logger.warning("JASON: reactor: calling stop()")
+        super().stop()
+        self._asyncioEventLoop.stop()
 
     def installNameResolver(self, resolver: IHostnameResolver) -> IHostnameResolver:
         raise NotImplementedError()
@@ -646,10 +673,14 @@ class ThreadedMemoryReactorClock(MemoryReactorClock):
         return conn
 
     def advance(self, amount: float) -> None:
+        logger.warning("JASON: reactor: calling advance(): %r", amount)
         # first advance our reactor's time, and run any "callLater" callbacks that
         # makes ready
         super().advance(amount)
 
+        # TODO: probably insert the asyncio event loop pump here
+        self._asyncioEventLoop.call_later(amount, self._asyncioEventLoop.stop)
+        self._asyncioEventLoop.run_forever()
         # now run any "callFromThread" callbacks
         while True:
             try:
@@ -668,6 +699,9 @@ class ThreadedMemoryReactorClock(MemoryReactorClock):
             # reactor.callFromThread to feed results back from the db functions to the
             # main thread.
             super().advance(0)
+
+    def __del__(self) -> None:
+        self._time_patcher.stop()
 
 
 def cleanup_test_reactor_system_event_triggers(
@@ -737,7 +771,7 @@ def make_fake_db_pool(
     db_config: DatabaseConnectionConfig,
     engine: BaseDatabaseEngine,
     server_name: str,
-) -> adbapi.ConnectionPool | psycopg_pool.ConnectionPool:
+) -> adbapi.ConnectionPool | psycopg_pool.AsyncConnectionPool:
     """Wrapper for `make_pool` which builds a pool which runs db queries synchronously.
 
     For more deterministic testing, we don't use a regular db connection pool: instead
@@ -748,7 +782,7 @@ def make_fake_db_pool(
     pool = make_pool(
         reactor=reactor, db_config=db_config, engine=engine, server_name=server_name
     )
-    if isinstance(pool, psycopg_pool.ConnectionPool):
+    if isinstance(pool, psycopg_pool.AsyncConnectionPool):
         return pool
 
     def runWithConnection(
@@ -1292,7 +1326,7 @@ def setup_test_homeserver(
     # Ideally, setup/start would be separated but since this is historically used
     # throughout tests, we keep the existing behavior for now. We probably just need to
     # rename this function.
-    start_test_homeserver(hs=hs, cleanup_func=cleanup_func, reactor=reactor)
+    # start_test_homeserver(hs=hs, cleanup_func=cleanup_func, reactor=reactor)
 
     return hs
 
@@ -1314,6 +1348,7 @@ def start_test_homeserver(
             proceeding to the next cleanup function.
         reactor: Twisted reactor
     """
+    # gather_results((defer.ensureDeferred(hs.get_datastores().databases[0].open()),))
 
     # Register background tasks required by this server. This must be done
     # somewhat manually due to the background tasks not being registered

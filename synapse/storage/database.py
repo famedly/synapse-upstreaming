@@ -57,7 +57,6 @@ from synapse.config.database import DatabaseConnectionConfig
 from synapse.logging import opentracing
 from synapse.logging.context import (
     LoggingContext,
-    PreserveLoggingContext,
     current_context,
     make_deferred_yieldable,
 )
@@ -142,7 +141,7 @@ def make_pool(
     db_config: DatabaseConnectionConfig,
     engine: BaseDatabaseEngine,
     server_name: str,
-) -> adbapi.ConnectionPool | psycopg_pool.ConnectionPool:
+) -> adbapi.ConnectionPool | psycopg_pool.AsyncConnectionPool:
     """
     Create the actual database pool based on it's engine. The fallback is the adbapi
     compatible Twisted pool.
@@ -212,7 +211,7 @@ def make_psycopg_pool(
     db_config: DatabaseConnectionConfig,
     engine: PsycopgEngine,
     server_name: str,
-) -> psycopg_pool.ConnectionPool:
+) -> psycopg_pool.AsyncConnectionPool:
     """Get the specialized Psycopg connection pool for the database. Only works with
     Postgres and version 3+ of the Psycopg driver."""
 
@@ -229,7 +228,7 @@ def make_psycopg_pool(
         if key in psycopg_pool_setting_names_to_exclude
     }
 
-    def _on_new_connection(conn: psycopg.Connection[Any]) -> None:
+    async def _on_new_connection(conn: psycopg.AsyncConnection[Any]) -> None:
         # Ensure we have a logging context so we can correctly track queries,
         # etc.
         with LoggingContext(name="db.on_new_connection", server_name=server_name):
@@ -242,16 +241,17 @@ def make_psycopg_pool(
                 )
             )
 
-    connection_pool = psycopg_pool.ConnectionPool(
+    connection_pool = psycopg_pool.AsyncConnectionPool(
         "",
         configure=_on_new_connection,
         # Using open=True on the creation of the class is considered deprecated, but
         # still functions for now. Later, will have to change to calling Class.open()
         # when the database is required to be open expressly.
-        open=True,
+        open=False,
         kwargs=conn_args,
         **pool_args,
     )
+    # await connection_pool.open()
 
     # Not sure we can access the thread pool inside the psycopg connection pool. It is
     # only used to produce connections and not for running any kind of transactions.
@@ -793,6 +793,12 @@ class DatabasePool(abc.ABC):
     def name(self) -> str:
         "Return the name of this database"
         return self._database_config.name
+
+    @abc.abstractmethod
+    async def open(self) -> None: ...
+
+    @abc.abstractmethod
+    async def close(self) -> None: ...
 
     @abc.abstractmethod
     def is_running(self) -> bool: ...
@@ -2601,6 +2607,14 @@ class DatabasePool(abc.ABC):
 class TwistedDatabasePool(DatabasePool):
     _db_pool: adbapi.ConnectionPool
 
+    async def open(self) -> None:
+        # Twisted's pool just is automatically ready, and the pool fills on-demand for
+        # connections. So this is just a no-op
+        pass
+
+    async def close(self) -> None:
+        self._db_pool.close()
+
     def is_running(self) -> bool:
         """Is the database pool currently running"""
         return self._db_pool.running
@@ -2794,7 +2808,17 @@ class TwistedDatabasePool(DatabasePool):
 
 
 class PsycopgDatabasePool(DatabasePool):
-    _db_pool: psycopg_pool.ConnectionPool[Any]
+    _db_pool: psycopg_pool.AsyncConnectionPool[Any]
+
+    async def open(self) -> None:
+        logger.warning("JASON: Trying to open pool")
+        await self._db_pool.open(wait=True, timeout=1.0)
+        logger.warning("JASON: open finished?")
+
+    async def close(self) -> None:
+        logger.warning("JASON: requesting pool close")
+        await self._db_pool.close()
+        logger.warning("JASON: pool says it's closed :man-shrug:")
 
     def is_running(self) -> bool:
         """Is the database pool currently running"""
@@ -2965,17 +2989,29 @@ class PsycopgDatabasePool(DatabasePool):
                         if isolation_level:
                             self.engine.attempt_to_set_isolation_level(conn, None)
 
+        # try:
+        #     with self._db_pool.connection() as pool_conn:
+        #         return inner_func(pool_conn, *args, **kwargs)
+        # except Exception as e:
+        #     logger.exception("Hit an exception when working on inner_func", stack_info=True)
+        #     raise
+        pool_conn = None
         try:
+            if not self.is_running():
+                logger.warning("Opening pool during transaction")
+                await self.open()
             # I'm not completely convinced yet that this is maintaining the log contexts
             # correctly. It does not seem to hurt
-            with PreserveLoggingContext():
-                pool_conn = self._db_pool.getconn()
+            pool_conn = await self._db_pool.getconn()
+            # with PreserveLoggingContext():
+            # result = await make_deferred_yieldable(defer.maybeDeferred(inner_func,pool_conn, *args, **kwargs))
             result = inner_func(pool_conn, *args, **kwargs)
             return result
         finally:
             # pool_conn reports that it may be referenced before assignment
-            with PreserveLoggingContext():
-                self._db_pool.putconn(pool_conn)
+            # with PreserveLoggingContext():
+            if pool_conn is not None:
+                await self._db_pool.putconn(pool_conn)
 
 
 def create_database_pool_class(
