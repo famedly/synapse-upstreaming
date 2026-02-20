@@ -18,6 +18,8 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+from __future__ import annotations
+
 from types import TracebackType
 from typing import (
     Any,
@@ -172,4 +174,152 @@ class DBAPI2Module(Protocol):
     def connect(self, *args: Any, **kwargs: Any) -> Connection: ...
 
 
-__all__ = ["Cursor", "Connection", "DBAPI2Module"]
+class AsyncCursor(Protocol):
+    async def execute(self, sql: str, parameters: SQLQueryParameters = ...) -> Any: ...
+
+    async def executemany(
+        self, sql: str, parameters: Sequence[SQLQueryParameters]
+    ) -> Any: ...
+
+    async def fetchone(self) -> tuple | None: ...
+
+    async def fetchmany(self, size: int | None = ...) -> list[tuple]: ...
+
+    async def fetchall(self) -> list[tuple]: ...
+
+    @property
+    def description(
+        self,
+    ) -> Sequence[Any] | None:
+        # At the time of writing, Synapse only assumes that `column[0]: str` for each
+        # `column in description`. Since this is hard to express in the type system, and
+        # as this is rarely used in Synapse, we deem `column: Any` good enough.
+        ...
+
+    @property
+    def rowcount(self) -> int:
+        return 0
+
+    def __aiter__(self) -> Iterator[tuple]: ...
+
+    async def close(self) -> None: ...
+
+
+class AsyncConnection(Protocol):
+    async def cursor(self) -> AsyncCursor: ...
+
+    async def close(self) -> None: ...
+
+    async def commit(self) -> None: ...
+
+    async def rollback(self) -> None: ...
+
+    def __aenter__(self) -> AsyncConnection: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None: ...
+
+
+class AsyncDBAPI2Module(Protocol):
+    """
+    The module-level attributes that we use from PEP 249, modified for async.
+
+    This is NOT a comprehensive stub for the entire DBAPI2, and is based on the similar
+    class above.
+    """
+
+    __name__: str
+
+    # Exceptions. See https://peps.python.org/pep-0249/#exceptions
+
+    # For our specific drivers:
+    # - Python's sqlite3 module doesn't contains the same descriptions as the
+    #   DBAPI2 spec, see https://docs.python.org/3/library/sqlite3.html#exceptions
+    # - Psycopg2 maps every Postgres error code onto a unique exception class which
+    #   extends from this hierarchy. See
+    #     https://docs.python.org/3/library/sqlite3.html?highlight=sqlite3#exceptions
+    #     https://www.postgresql.org/docs/current/errcodes-appendix.html#ERRCODES-TABLE
+    #
+    # Note: rather than
+    #     x: T
+    # we write
+    #     @property
+    #     def x(self) -> T: ...
+    # which expresses that the protocol attribute `x` is read-only. The mypy docs
+    #     https://mypy.readthedocs.io/en/latest/common_issues.html#covariant-subtyping-of-mutable-protocol-members-is-rejected
+    # explain why this is necessary for safety. TL;DR: we shouldn't be able to write
+    # to `x`, only read from it. See also https://github.com/python/mypy/issues/6002 .
+    @property
+    def Warning(self) -> type[Exception]: ...
+
+    @property
+    def Error(self) -> type[Exception]: ...
+
+    # Errors are divided into `InterfaceError`s (something went wrong in the database
+    # driver) and `DatabaseError`s (something went wrong in the database). These are
+    # both subclasses of `Error`, but we can't currently express this in type
+    # annotations due to https://github.com/python/mypy/issues/8397
+    @property
+    def InterfaceError(self) -> type[Exception]: ...
+
+    @property
+    def DatabaseError(self) -> type[Exception]: ...
+
+    # Everything below is a subclass of `DatabaseError`.
+
+    # Roughly: the database rejected a nonsensical value. Examples:
+    # - An integer was too big for its data type.
+    # - An invalid date time was provided.
+    # - A string contained a null code point.
+    @property
+    def DataError(self) -> type[Exception]: ...
+
+    # Roughly: something went wrong in the database, but it's not within the application
+    # programmer's control. Examples:
+    # - We failed to establish a connection to the database.
+    # - The connection to the database was lost.
+    # - A deadlock was detected.
+    # - A serialisation failure occurred.
+    # - The database ran out of resources, such as storage, memory, connections, etc.
+    # - The database encountered an error from the operating system.
+    @property
+    def OperationalError(self) -> type[Exception]: ...
+
+    # Roughly: we've given the database data which breaks a rule we asked it to enforce.
+    # Examples:
+    # - Stop, criminal scum! You violated the foreign key constraint
+    # - Also check constraints, non-null constraints, etc.
+    @property
+    def IntegrityError(self) -> type[Exception]: ...
+
+    # Roughly: something went wrong within the database server itself.
+    @property
+    def InternalError(self) -> type[Exception]: ...
+
+    # Roughly: the application did something silly that needs to be fixed. Examples:
+    # - We don't have permissions to do something.
+    # - We tried to create a table with duplicate column names.
+    # - We tried to use a reserved name.
+    # - We referred to a column that doesn't exist.
+    @property
+    def ProgrammingError(self) -> type[Exception]: ...
+
+    # Roughly: we've tried to do something that this database doesn't support.
+    @property
+    def NotSupportedError(self) -> type[Exception]: ...
+
+    async def connect(self, *args: Any, **kwargs: Any) -> AsyncConnection: ...
+
+
+__all__ = [
+    "Cursor",
+    "Connection",
+    "DBAPI2Module",
+    "AsyncCursor",
+    "AsyncConnection",
+    "AsyncDBAPI2Module",
+]
