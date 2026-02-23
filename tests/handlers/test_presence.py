@@ -842,8 +842,8 @@ class PresenceHandlerInitTestCase(unittest.HomeserverTestCase):
         )
 
         # Regenerate the preloaded presence information on PresenceStore.
-        def refill_presence(db_conn: LoggingDatabaseConnection) -> None:
-            main_store._presence_on_startup = main_store._get_active_presence(db_conn)
+        async def refill_presence(db_conn: LoggingDatabaseConnection) -> None:
+            main_store._presence_on_startup = await main_store._get_active_presence(db_conn)
 
         self.get_success(main_store.db_pool.runWithConnection(refill_presence))
 

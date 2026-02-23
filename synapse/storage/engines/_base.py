@@ -22,7 +22,7 @@ import abc
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Generic, Mapping, TypeVar
 
-from synapse.storage.types import Connection, Cursor, DBAPI2Module
+from synapse.storage.types import AsyncDBAPI2Module, Connection, Cursor, DBAPI2Module
 
 if TYPE_CHECKING:
     from synapse.storage.database import LoggingDatabaseConnection
@@ -51,7 +51,7 @@ IsolationLevelType = TypeVar("IsolationLevelType")
 class BaseDatabaseEngine(
     Generic[ConnectionType, CursorType, IsolationLevelType], metaclass=abc.ABCMeta
 ):
-    def __init__(self, module: DBAPI2Module, config: Mapping[str, Any]):
+    def __init__(self, module: DBAPI2Module | AsyncDBAPI2Module, config: Mapping[str, Any]):
         self.module = module
 
     @property
@@ -94,7 +94,7 @@ class BaseDatabaseEngine(
     def is_connection_closed(self, conn: ConnectionType) -> bool: ...
 
     @abc.abstractmethod
-    def lock_table(self, txn: Cursor, table: str) -> None: ...
+    async def lock_table(self, txn: Cursor, table: str) -> None: ...
 
     @property
     @abc.abstractmethod

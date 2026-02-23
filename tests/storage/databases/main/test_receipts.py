@@ -70,8 +70,8 @@ class ReceiptsBackgroundUpdateStoreTestCase(HomeserverTestCase):
         """
 
         # First, undo the background update.
-        def drop_receipts_unique_index(txn: LoggingTransaction) -> None:
-            txn.execute(f"DROP INDEX IF EXISTS {index_name}")
+        async def drop_receipts_unique_index(txn: LoggingTransaction) -> None:
+            await txn.execute("DROP INDEX IF EXISTS %s", (index_name,))
 
         self.get_success(
             self.store.db_pool.runInteraction(

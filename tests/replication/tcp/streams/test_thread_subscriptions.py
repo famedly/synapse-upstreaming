@@ -30,8 +30,8 @@ class ThreadSubscriptionsStreamTestCase(BaseStreamTestCase):
         super().prepare(reactor, clock, hs)
 
         # Postgres
-        def f(txn: LoggingTransaction) -> None:
-            txn.execute(
+        async def f(txn: LoggingTransaction) -> None:
+            return await txn.execute(
                 """
                 ALTER TABLE thread_subscriptions
                     DROP CONSTRAINT thread_subscriptions_fk_users,

@@ -36,7 +36,6 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
 from synapse.storage.engines._base import IsolationLevel
-from synapse.storage.types import Connection
 from synapse.storage.util.id_generators import MultiWriterIdGenerator
 from synapse.util.caches.descriptors import cached, cachedList
 from synapse.util.caches.stream_change_cache import StreamChangeCache
@@ -94,7 +93,9 @@ class PresenceStore(PresenceBackgroundUpdateStore, CacheInvalidationWorkerStore)
         )
 
         self.hs = hs
-        self._presence_on_startup = self._get_active_presence(db_conn)
+        self._presence_on_startup: list[UserPresenceState] = []
+        # TODO: I don't think this will work right, with the db_conn passed this way
+        self.clock.callWhenRunning(self._get_active_presence, db_conn)
 
         presence_cache_prefill, min_presence_val = self.db_pool.get_cache_dict(
             db_conn,
@@ -134,7 +135,7 @@ class PresenceStore(PresenceBackgroundUpdateStore, CacheInvalidationWorkerStore)
 
         return stream_orderings[-1], self._presence_id_gen.get_current_token()
 
-    def _update_presence_txn(
+    async def _update_presence_txn(
         self,
         txn: LoggingTransaction,
         stream_orderings: list[int],
@@ -153,10 +154,10 @@ class PresenceStore(PresenceBackgroundUpdateStore, CacheInvalidationWorkerStore)
             clause, args = make_in_list_sql_clause(
                 self.database_engine, "user_id", [s.user_id for s in states]
             )
-            txn.execute(sql + clause, [stream_id] + list(args))
+            await txn.execute(sql + clause, [stream_id] + list(args))
 
         # Actually insert new rows
-        self.db_pool.simple_insert_many_txn(
+        await self.db_pool.simple_insert_many_txn(
             txn,
             table="presence_stream",
             keys=(
@@ -213,7 +214,7 @@ class PresenceStore(PresenceBackgroundUpdateStore, CacheInvalidationWorkerStore)
         if last_id == current_id:
             return [], current_id, False
 
-        def get_all_presence_updates_txn(
+        async def get_all_presence_updates_txn(
             txn: LoggingTransaction,
         ) -> tuple[list[tuple[int, list]], int, bool]:
             sql = """
@@ -225,11 +226,15 @@ class PresenceStore(PresenceBackgroundUpdateStore, CacheInvalidationWorkerStore)
                 ORDER BY stream_id ASC
                 LIMIT ?
             """
-            txn.execute(sql, (last_id, current_id, limit))
-            updates = cast(
-                list[tuple[int, list]],
-                [(row[0], row[1:]) for row in txn],
-            )
+            await txn.execute(sql, (last_id, current_id, limit))
+            updates: list[tuple[int, list]]
+            if hasattr(txn.txn, "__aiter__"):
+                updates = [(row[0], row[1:]) async for row in txn]  # type: ignore[attr-defined]
+
+            else:
+                assert hasattr(txn.txn, "__iter__")
+                updates = [(row[0], row[1:]) for row in txn]  # type: ignore[attr-defined]
+
 
             upper_bound = current_id
             limited = False
@@ -343,8 +348,8 @@ class PresenceStore(PresenceBackgroundUpdateStore, CacheInvalidationWorkerStore)
         # exists in the table.
         presence_stream_id = self._presence_id_gen.get_current_token()
 
-        def _add_users_to_send_full_presence_to(txn: LoggingTransaction) -> None:
-            self.db_pool.simple_upsert_many_txn(
+        async def _add_users_to_send_full_presence_to(txn: LoggingTransaction) -> None:
+            await self.db_pool.simple_upsert_many_txn(
                 txn,
                 table="users_to_send_full_presence_to",
                 key_names=("user_id",),
@@ -452,7 +457,7 @@ class PresenceStore(PresenceBackgroundUpdateStore, CacheInvalidationWorkerStore)
     def get_presence_stream_id_gen(self) -> MultiWriterIdGenerator:
         return self._presence_id_gen
 
-    def _get_active_presence(self, db_conn: Connection) -> list[UserPresenceState]:
+    async def _get_active_presence(self, db_conn: LoggingDatabaseConnection) -> list[UserPresenceState]:
         """Fetch non-offline presence from the database so that we can register
         the appropriate time outs.
         """
@@ -465,10 +470,10 @@ class PresenceStore(PresenceBackgroundUpdateStore, CacheInvalidationWorkerStore)
             " WHERE state != ?"
         )
 
-        txn = db_conn.cursor()
-        txn.execute(sql, (PresenceState.OFFLINE,))
-        rows = txn.fetchall()
-        txn.close()
+        txn = await db_conn.cursor()
+        await txn.execute(sql, (PresenceState.OFFLINE,))
+        rows = await txn.fetchall()
+        await txn.close()
 
         return [
             UserPresenceState(
@@ -483,8 +488,8 @@ class PresenceStore(PresenceBackgroundUpdateStore, CacheInvalidationWorkerStore)
             for user_id, state, last_active_ts, last_federation_update_ts, last_user_sync_ts, status_msg, currently_active in rows
         ]
 
-    def take_presence_startup_info(self) -> list[UserPresenceState]:
-        active_on_startup = self._presence_on_startup
+    async def take_presence_startup_info(self) -> list[UserPresenceState]:
+        active_on_startup = await self._presence_on_startup
         self._presence_on_startup = []
         return active_on_startup
 

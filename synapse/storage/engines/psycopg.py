@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
 import logging
 from typing import Any, Mapping
 
@@ -21,6 +22,7 @@ import psycopg.sql
 
 from twisted.enterprise.adbapi import Connection as TxConnection
 
+from synapse.storage.database import LoggingDatabaseConnection
 from synapse.storage.engines import PostgresEngine
 from synapse.storage.engines._base import IsolationLevel
 
@@ -70,10 +72,35 @@ class PsycopgEngine(
         cursor.execute(query_str.as_string())
 
     def convert_param_style(self, sql: str) -> str:
-        # if isinstance(sql, psycopg.sql.Composed):
-        #     return sql
-
         return sql.replace("?", "%s")
+
+    def on_new_connection(self, db_conn: LoggingDatabaseConnection) -> None:
+        raise NotImplementedError("Intentionally not implemented")
+    async def on_new_async_connection(self, db_conn: LoggingDatabaseConnection) -> None:
+        # mypy doesn't realize that ConnectionType matches the Connection protocol.
+        self.attempt_to_set_isolation_level(db_conn.conn)  # type: ignore[arg-type]
+
+        # Set the bytea output to escape, vs the default of hex
+        cursor = await db_conn.cursor()
+        await cursor.execute("SET bytea_output TO escape")
+
+        # Asynchronous commit, don't wait for the server to call fsync before
+        # ending the transaction.
+        # https://www.postgresql.org/docs/current/static/wal-async-commit.html
+        if not self.synchronous_commit:
+            await cursor.execute("SET synchronous_commit TO OFF")
+
+        # Abort really long-running statements and turn them into errors.
+        if self.statement_timeout is not None:
+            # Because the PostgresEngine is considered an ABCMeta, a superclass and a
+            # subclass, cursor's type is messy. We know it should be a CursorType,
+            # but for now that doesn't pass cleanly through LoggingDatabaseConnection
+            # and LoggingTransaction. Fortunately, it's merely running an execute()
+            # and nothing more exotic.
+            self.set_statement_timeout(cursor.txn, self.statement_timeout)  # type: ignore[arg-type]
+
+        await cursor.close()
+        await db_conn.commit()
 
     def is_deadlock(self, error: Exception) -> bool:
         if isinstance(error, psycopg.errors.Error):
@@ -93,6 +120,8 @@ class PsycopgEngine(
         # it because it doesn't support __setattr__.
         if isinstance(conn, TxConnection):
             conn = conn._connection
+        # With the AsyncConnection from psycopg this will be a read-only attribute. A
+        # setter method is provided
         conn.autocommit = autocommit
 
     def attempt_to_set_isolation_level(
@@ -102,4 +131,6 @@ class PsycopgEngine(
             pg_isolation_level = self.default_isolation_level
         else:
             pg_isolation_level = self.isolation_level_map[isolation_level]
+        # With the AsyncConnection from psycopg this will be a read-only attribute. A
+        # setter method is provided
         conn.isolation_level = pg_isolation_level

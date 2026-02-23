@@ -121,7 +121,7 @@ class Sqlite3Engine(BaseDatabaseEngine[sqlite3.Connection, sqlite3.Cursor, int])
     def is_connection_closed(self, conn: sqlite3.Connection) -> bool:
         return False
 
-    def lock_table(self, txn: Cursor, table: str) -> None:
+    async def lock_table(self, txn: Cursor, table: str) -> None:
         return
 
     @property

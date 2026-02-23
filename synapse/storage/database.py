@@ -29,11 +29,11 @@ from time import monotonic as monotonic_time
 from typing import (
     TYPE_CHECKING,
     Any,
+    AsyncIterable,
     Awaitable,
     Callable,
     Collection,
     Iterable,
-    Iterator,
     Literal,
     Mapping,
     Sequence,
@@ -67,9 +67,15 @@ from synapse.storage.engines import (
     Sqlite3Engine,
 )
 from synapse.storage.engines._base import IsolationLevel
-from synapse.storage.types import Connection, Cursor, SQLQueryParameters
+from synapse.storage.types import (
+    AsyncConnection,
+    AsyncCursor,
+    Connection,
+    Cursor,
+    SQLQueryParameters,
+)
 from synapse.types import StrCollection
-from synapse.util.async_helpers import delay_cancellation
+from synapse.util.async_helpers import delay_cancellation, maybe_awaitable
 from synapse.util.duration import Duration
 from synapse.util.iterutils import batch_iter
 
@@ -213,12 +219,12 @@ class LoggingDatabaseConnection:
     This is mainly used on startup to ensure that queries get logged correctly
     """
 
-    conn: Connection
+    conn: AsyncConnection | Connection
     engine: BaseDatabaseEngine
     default_txn_name: str
     server_name: str
 
-    def cursor(
+    async def cursor(
         self,
         *,
         txn_name: str | None = None,
@@ -229,8 +235,9 @@ class LoggingDatabaseConnection:
         if not txn_name:
             txn_name = self.default_txn_name
 
+        cur: AsyncCursor | Cursor = await maybe_awaitable(self.conn.cursor())
         return LoggingTransaction(
-            txn=self.conn.cursor(),
+            txn=cur,
             name=txn_name,
             server_name=self.server_name,
             database_engine=self.engine,
@@ -239,26 +246,32 @@ class LoggingDatabaseConnection:
             exception_callbacks=exception_callbacks,
         )
 
-    def close(self) -> None:
-        self.conn.close()
+    async def close(self) -> None:
+        return await maybe_awaitable(self.conn.close())
 
-    def commit(self) -> None:
-        self.conn.commit()
+    async def commit(self) -> None:
+        return await maybe_awaitable(self.conn.commit())
 
-    def rollback(self) -> None:
-        self.conn.rollback()
+    async def rollback(self) -> None:
+        return await maybe_awaitable(self.conn.rollback())
 
-    def __enter__(self) -> "LoggingDatabaseConnection":
-        self.conn.__enter__()
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: types.TracebackType | None,
-    ) -> bool | None:
-        return self.conn.__exit__(exc_type, exc_value, traceback)
+    # If this attribute is being proxied to the underlying LoggingDatabaseConnection, do we even need this?
+    # def __aenter__(self) -> "LoggingDatabaseConnection":
+    #     if hasattr(self.conn, "__aenter__"):
+    #         self.conn.__aenter__()
+    #         return self
+    #     self.conn.__enter__()
+    #     return self
+    #
+    # async def __aexit__(
+    #     self,
+    #     exc_type: type[BaseException] | None,
+    #     exc_value: BaseException | None,
+    #     traceback: types.TracebackType | None,
+    # ) -> bool | None:
+    #     if hasattr(self.conn, "__exit__"):
+    #         return self.conn.__exit__(exc_type, exc_value, traceback)
+    #     return await self.conn.__aexit__(exc_type, exc_value, traceback)
 
     # Proxy through any unknown lookups to the DB conn class.
     def __getattr__(self, name: str) -> Any:
@@ -311,7 +324,7 @@ class LoggingTransaction:
     def __init__(
         self,
         *,
-        txn: Cursor,
+        txn: AsyncCursor | Cursor,
         name: str,
         server_name: str,
         database_engine: BaseDatabaseEngine,
@@ -387,17 +400,32 @@ class LoggingTransaction:
         assert self.exception_callbacks is not None
         self.exception_callbacks.append((callback, args, kwargs))
 
-    def fetchone(self) -> tuple | None:
-        return self.txn.fetchone()
+    async def fetchone(self) -> tuple | None:
+        do = self.txn.fetchone()
+        if inspect.isawaitable(do):
+            return await do
+        return do
 
-    def fetchmany(self, size: int | None = None) -> list[tuple]:
-        return self.txn.fetchmany(size=size)
+    async def fetchmany(self, size: int | None = None) -> list[tuple]:
+        do = self.txn.fetchmany(size=size)
+        if inspect.isawaitable(do):
+            return await do
+        return do
 
-    def fetchall(self) -> list[tuple]:
-        return self.txn.fetchall()
+    async def fetchall(self) -> list[tuple]:
+        do = self.txn.fetchall()
+        if inspect.isawaitable(do):
+            return await do
+        return do
 
-    def __iter__(self) -> Iterator[tuple]:
-        return self.txn.__iter__()
+    # def __aiter__(self) -> AsyncIterator[tuple]:
+    #     return self.txn.__aiter__()
+    #     # if inspect.isawaitable(do):
+    #     #     return await do
+    #     # return do
+    #
+    # def __iter__(self) -> Iterator[tuple]:
+    #     return self.txn.__iter__()
 
     @property
     def rowcount(self) -> int:
@@ -409,7 +437,7 @@ class LoggingTransaction:
     ) -> Sequence[Any] | None:
         return self.txn.description
 
-    def execute_batch(self, sql: str, args: Iterable[Iterable[Any]]) -> None:
+    async def execute_batch(self, sql: str, args: Iterable[Iterable[Any]]) -> None:
         """Similar to `executemany`, except `txn.rowcount` will not be correct
         afterwards.
 
@@ -422,7 +450,7 @@ class LoggingTransaction:
             # TODO: is it safe for values to be Iterable[Iterable[Any]] here?
             # https://www.psycopg.org/docs/extras.html?highlight=execute_batch#psycopg2.extras.execute_batch
             # suggests each arg in args should be a sequence or mapping
-            self._do_execute(
+            await self._do_execute(
                 lambda the_sql: execute_batch(self.txn, the_sql, args), sql
             )
 
@@ -433,15 +461,15 @@ class LoggingTransaction:
             # suggests that the outer collection may be iterable, but
             # https://docs.python.org/3/library/sqlite3.html?highlight=sqlite3#how-to-use-placeholders-to-bind-values-in-sql-queries
             # suggests that the inner collection should be a sequence or dict.
-            self.executemany(sql, args)
+            await self.executemany(sql, args)
 
-    def execute_values(
+    async def execute_values(
         self,
         sql: str,
         values: Collection[Iterable[Any]],
         template: str | None = None,
         fetch: bool = True,
-    ) -> Iterable[tuple]:
+    ) -> Iterable[tuple] | AsyncIterable[tuple]:
         """Corresponds to psycopg2.extras.execute_values. Only available when
         using postgres.
 
@@ -460,7 +488,7 @@ class LoggingTransaction:
         if isinstance(self.database_engine, Psycopg2Engine):
             from psycopg2.extras import execute_values
 
-            return self._do_execute(
+            return await self._do_execute(
                 # TODO: is it safe for values to be Iterable[Iterable[Any]] here?
                 # https://www.psycopg.org/docs/extras.html?highlight=execute_batch#psycopg2.extras.execute_values says values should be Sequence[Sequence]
                 lambda the_sql, the_values: execute_values(
@@ -483,34 +511,37 @@ class LoggingTransaction:
             # Wrap the SQL in the COPY statement.
             sql = f"COPY ({sql}) TO STDOUT"
 
-            def f(
+            async def f(
                 the_sql: str, the_args: Sequence[Sequence[Any]]
-            ) -> Iterable[tuple[Any, ...]]:
-                with self.txn.copy(the_sql, the_args) as copy:  # type: ignore[attr-defined]
-                    yield from copy.rows()
+            ) -> AsyncIterable[tuple[Any, ...]]:
+                async with self.txn.copy(the_sql, the_args) as copy:  # type: ignore[union-attr]
+                    return await copy.rows()
 
             # Flatten the values.
-            return self._do_execute(f, sql, list(itertools.chain.from_iterable(values)))
+            return await self._do_execute(
+                f, sql, list(itertools.chain.from_iterable(values))
+            )
 
-    def copy_write(
+    async def copy_write(
         self, sql: str, args: Iterable[Any], values: Iterable[Iterable[Any]]
     ) -> None:
         """Corresponds to a PostgreSQL COPY (...) FROM STDIN call."""
         assert isinstance(self.database_engine, PsycopgEngine)
 
-        def f(
+        async def f(
             the_sql: str, the_args: Iterable[Any], the_values: Iterable[Iterable[Any]]
         ) -> None:
-            with self.txn.copy(the_sql, the_args) as copy:  # type: ignore[attr-defined]
+            async with self.txn.copy(the_sql, the_args) as copy:  # type: ignore[union-attr]
                 for record in the_values:
-                    copy.write_row(record)
+                    await copy.write_row(record)
+            return
 
-        self._do_execute(f, sql, args, values)
+        await self._do_execute(f, sql, args, values)
 
-    def execute(self, sql: str, parameters: SQLQueryParameters = ()) -> None:
-        self._do_execute(self.txn.execute, sql, parameters)
+    async def execute(self, sql: str, parameters: SQLQueryParameters = ()) -> None:
+        await self._do_execute(self.txn.execute, sql, parameters)
 
-    def executemany(self, sql: str, *args: Any) -> None:
+    async def executemany(self, sql: str, *args: Any) -> None:
         """Repeatedly execute the same piece of SQL with different parameters.
 
         See https://peps.python.org/pep-0249/#executemany. Note in particular that
@@ -525,23 +556,24 @@ class LoggingTransaction:
         # and DBAPI2 it ought to be Sequence[_Parameter], but we pass in
         # Iterable[Iterable[Any]] in execute_batch and execute_values above, which mypy
         # complains about.
-        self._do_execute(self.txn.executemany, sql, *args)
+        await self._do_execute(self.txn.executemany, sql, *args)
 
-    def executescript(self, sql: str) -> None:
-        if isinstance(self.database_engine, Sqlite3Engine):
-            self._do_execute(self.txn.executescript, sql)  # type: ignore[attr-defined]
-        else:
-            raise NotImplementedError(
-                f"executescript only exists for sqlite driver, not {type(self.database_engine)}"
-            )
+    # Is this even used?
+    # async def executescript(self, sql: str) -> None:
+    #     if isinstance(self.database_engine, Sqlite3Engine):
+    #         await self._do_execute(self.txn.executescript, sql)  # type: ignore[attr-defined]
+    #     else:
+    #         raise NotImplementedError(
+    #             f"executescript only exists for sqlite driver, not {type(self.database_engine)}"
+    #         )
 
     def _make_sql_one_line(self, sql: str) -> str:
         "Strip newlines out of SQL so that the loggers in the DB are on one line"
         return " ".join(line.strip() for line in sql.splitlines() if line.strip())
 
-    def _do_execute(
+    async def _do_execute(
         self,
-        func: Callable[Concatenate[str, P], R],
+        func: Callable[Concatenate[str, P], Awaitable[R] | R],
         sql: str,
         *args: P.args,
         **kwargs: P.kwargs,
@@ -571,7 +603,7 @@ class LoggingTransaction:
                     opentracing.tags.DATABASE_STATEMENT: one_line_sql,
                 },
             ):
-                return func(sql, *args, **kwargs)
+                return await maybe_awaitable(func(sql, *args, **kwargs))
         except Exception as e:
             sql_logger.debug("[SQL FAIL] {%s} %s", self.name, e)
             raise
@@ -582,19 +614,37 @@ class LoggingTransaction:
                 verb=one_line_sql.split()[0], **{SERVER_NAME_LABEL: self.server_name}
             ).observe(secs)
 
-    def close(self) -> None:
-        self.txn.close()
+    async def close(self) -> None:
+        do = self.txn.close()
+        if inspect.isawaitable(do):
+            return await do
+        return do
 
-    def __enter__(self) -> "LoggingTransaction":
-        return self
+    # def __enter__(self) -> "LoggingTransaction":
+    #     return self
+    #
+    # def __exit__(
+    #     self,
+    #     exc_type: type[BaseException] | None,
+    #     exc_value: BaseException | None,
+    #     traceback: types.TracebackType | None,
+    # ) -> None:
+    #     self.close()
+    #
+    # def __aenter__(self) -> "LoggingTransaction":
+    #     return self
+    #
+    # async def __aexit__(
+    #     self,
+    #     exc_type: type[BaseException] | None,
+    #     exc_value: BaseException | None,
+    #     traceback: types.TracebackType | None,
+    # ) -> None:
+    #     await self.close()
 
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: types.TracebackType | None,
-    ) -> None:
-        self.close()
+    # Proxy through any unknown lookups to the DB conn class.
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.txn, name)
 
 
 class PerformanceCounters:
@@ -763,7 +813,7 @@ class DatabasePool:
 
         self._clock.looping_call(loop, Duration(seconds=10))
 
-    def new_transaction(
+    async def new_transaction(
         self,
         conn: LoggingDatabaseConnection,
         desc: str,
@@ -856,7 +906,7 @@ class DatabasePool:
         try:
             MAX_NUMBER_OF_ATTEMPTS = 5
             for attempt_number in range(1, MAX_NUMBER_OF_ATTEMPTS + 1):
-                cursor = conn.cursor(
+                cursor = await conn.cursor(
                     txn_name=name,
                     after_callbacks=after_callbacks,
                     async_after_callbacks=async_after_callbacks,
@@ -870,9 +920,9 @@ class DatabasePool:
                             opentracing.SynapseTags.DB_TXN_ID: name,
                         },
                     ):
-                        r = func(cursor, *args, **kwargs)
+                        r = await maybe_awaitable(func(cursor, *args, **kwargs))
                         opentracing.log_kv({"message": "commit"})
-                        conn.commit()
+                        await conn.commit()
                         return r
                 except self.engine.module.OperationalError as e:
                     # This can happen if the database disappears mid
@@ -886,7 +936,7 @@ class DatabasePool:
                     )
                     try:
                         with opentracing.start_active_span("db.rollback"):
-                            conn.rollback()
+                            await conn.rollback()
                     except self.engine.module.Error as e1:
                         transaction_logger.warning("[TXN EROLL] {%s} %s", name, e1)
                     # Keep retrying if we haven't reached max attempts
@@ -903,7 +953,7 @@ class DatabasePool:
                         )
                         try:
                             with opentracing.start_active_span("db.rollback"):
-                                conn.rollback()
+                                await conn.rollback()
                         except self.engine.module.Error as e1:
                             transaction_logger.warning(
                                 "[TXN EROLL] {%s} %s",
@@ -947,7 +997,7 @@ class DatabasePool:
                     #
                     # [1]: https://github.com/python/cpython/blob/v3.8.0/Modules/_sqlite/connection.c#L465
                     # [2]: https://github.com/python/cpython/blob/v3.8.0/Modules/_sqlite/cursor.c#L236
-                    cursor.close()
+                    await cursor.close()
             else:
                 # To appease the linter, we mark this as unreachable. Unreachable
                 # because we expect the code above to always return from the loop or
@@ -988,7 +1038,7 @@ class DatabasePool:
     async def runInteraction(
         self,
         desc: str,
-        func: Callable[..., R],
+        func: Callable[..., Awaitable[R]],
         *args: Any,
         db_autocommit: bool = False,
         isolation_level: IsolationLevel | None = None,
@@ -1070,7 +1120,7 @@ class DatabasePool:
 
     async def runWithConnection(
         self,
-        func: Callable[Concatenate[LoggingDatabaseConnection, P], R],
+        func: Callable[Concatenate[LoggingDatabaseConnection, P], Awaitable[R]],
         *args: Any,
         db_autocommit: bool = False,
         isolation_level: IsolationLevel | None = None,
@@ -1104,7 +1154,9 @@ class DatabasePool:
 
         start_time = monotonic_time()
 
-        def inner_func(conn: _PoolConnection, *args: P.args, **kwargs: P.kwargs) -> R:
+        async def inner_func(
+            conn: _PoolConnection, *args: P.args, **kwargs: P.kwargs
+        ) -> R:
             # We shouldn't be in a transaction. If we are then something
             # somewhere hasn't committed after doing work. (This is likely only
             # possible during startup, as `run*` will ensure changes are
@@ -1161,7 +1213,13 @@ class DatabasePool:
                             default_txn_name="runWithConnection",
                             server_name=self.server_name,
                         )
-                        return func(db_conn, *args, **kwargs)
+                        do = await func(db_conn, *args, **kwargs)
+                        # if inspect.isawaitable(do):
+                        #     return await do
+                        # Like stated elsewhere, isawaitable has a TypeGuard, but mypy
+                        # doesn't recognize it
+                        # assert not isinstance(do, Awaitable)
+                        return do
                     finally:
                         if db_autocommit:
                             self.engine.attempt_to_set_autocommit(conn, False)
@@ -1183,9 +1241,9 @@ class DatabasePool:
             The result of decoder(results)
         """
 
-        def interaction(txn: LoggingTransaction) -> list[tuple[Any, ...]]:
-            txn.execute(query, args)
-            return txn.fetchall()
+        async def interaction(txn: LoggingTransaction) -> list[tuple[Any, ...]]:
+            await txn.execute(query, args)
+            return await txn.fetchall()
 
         return await self.runInteraction(desc, interaction)
 
@@ -1208,7 +1266,7 @@ class DatabasePool:
         await self.runInteraction(desc, self.simple_insert_txn, table, values)
 
     @staticmethod
-    def simple_insert_txn(
+    async def simple_insert_txn(
         txn: LoggingTransaction, table: str, values: dict[str, Any]
     ) -> None:
         keys, vals = zip(*values.items())
@@ -1219,10 +1277,10 @@ class DatabasePool:
             ", ".join("?" for _ in keys),
         )
 
-        txn.execute(sql, vals)
+        return await txn.execute(sql, vals)
 
     @staticmethod
-    def simple_insert_returning_txn(
+    async def simple_insert_returning_txn(
         txn: LoggingTransaction,
         table: str,
         values: dict[str, Any],
@@ -1239,8 +1297,8 @@ class DatabasePool:
             ", ".join(k for k in returning),
         )
 
-        txn.execute(sql, list(values.values()))
-        row = txn.fetchone()
+        await txn.execute(sql, list(values.values()))
+        row = await txn.fetchone()
         assert row is not None
         return row
 
@@ -1267,7 +1325,7 @@ class DatabasePool:
         )
 
     @staticmethod
-    def simple_insert_many_txn(
+    async def simple_insert_many_txn(
         txn: LoggingTransaction,
         table: str,
         keys: Sequence[str],
@@ -1296,14 +1354,14 @@ class DatabasePool:
                 ", ".join(k for k in keys),
             )
 
-            txn.execute_values(sql, values, fetch=False)
+            await txn.execute_values(sql, values, fetch=False)
 
         elif isinstance(txn.database_engine, PsycopgEngine):
             sql = "COPY %s (%s) FROM STDIN" % (
                 table,
                 ", ".join(k for k in keys),
             )
-            txn.copy_write(sql, (), values)
+            await txn.copy_write(sql, (), values)
 
         else:
             sql = "INSERT INTO %s (%s) VALUES(%s)" % (
@@ -1312,7 +1370,9 @@ class DatabasePool:
                 ", ".join("?" for _ in keys),
             )
 
-            txn.execute_batch(sql, values)
+            await txn.execute_batch(sql, values)
+
+        return
 
     async def simple_upsert(
         self,
@@ -1407,7 +1467,7 @@ class DatabasePool:
                     "IntegrityError when upserting into %s; retrying: %s", table, e
                 )
 
-    def simple_upsert_txn(
+    async def simple_upsert_txn(
         self,
         txn: LoggingTransaction,
         table: str,
@@ -1434,7 +1494,7 @@ class DatabasePool:
         insertion_values = insertion_values or {}
 
         if table not in self._unsafe_to_upsert_tables:
-            return self.simple_upsert_txn_native_upsert(
+            return await self.simple_upsert_txn_native_upsert(
                 txn,
                 table,
                 keyvalues,
@@ -1443,7 +1503,7 @@ class DatabasePool:
                 where_clause=where_clause,
             )
         else:
-            return self.simple_upsert_txn_emulated(
+            return await self.simple_upsert_txn_emulated(
                 txn,
                 table,
                 keyvalues,
@@ -1452,7 +1512,7 @@ class DatabasePool:
                 where_clause=where_clause,
             )
 
-    def simple_upsert_txn_emulated(
+    async def simple_upsert_txn_emulated(
         self,
         txn: LoggingTransaction,
         table: str,
@@ -1501,7 +1561,7 @@ class DatabasePool:
             # SELECT instead to see if it exists.
             sql = "SELECT 1 FROM %s WHERE %s" % (table, " AND ".join(where))
             sqlargs = list(keyvalues.values())
-            txn.execute(sql, sqlargs)
+            await txn.execute(sql, sqlargs)
             if txn.fetchall():
                 # We have an existing record.
                 return False
@@ -1514,7 +1574,7 @@ class DatabasePool:
             )
             sqlargs = list(values.values()) + list(keyvalues.values())
 
-            txn.execute(sql, sqlargs)
+            await txn.execute(sql, sqlargs)
             if txn.rowcount > 0:
                 return True
 
@@ -1529,12 +1589,12 @@ class DatabasePool:
             ", ".join(k for k in allvalues),
             ", ".join("?" for _ in allvalues),
         )
-        txn.execute(sql, list(allvalues.values()))
+        await txn.execute(sql, list(allvalues.values()))
         # successfully inserted
         return True
 
     @staticmethod
-    def simple_upsert_txn_native_upsert(
+    async def simple_upsert_txn_native_upsert(
         txn: LoggingTransaction,
         table: str,
         keyvalues: Mapping[str, Any],
@@ -1574,7 +1634,7 @@ class DatabasePool:
             f"WHERE {where_clause} " if where_clause else "",
             latter,
         )
-        txn.execute(sql, list(allvalues.values()))
+        await txn.execute(sql, list(allvalues.values()))
 
         return bool(txn.rowcount)
 
@@ -1649,7 +1709,7 @@ class DatabasePool:
             db_autocommit=autocommit,
         )
 
-    def simple_upsert_many_txn(
+    async def simple_upsert_many_txn(
         self,
         txn: LoggingTransaction,
         table: str,
@@ -1685,11 +1745,11 @@ class DatabasePool:
             )
 
         if table not in self._unsafe_to_upsert_tables:
-            return self.simple_upsert_many_txn_native_upsert(
+            return await self.simple_upsert_many_txn_native_upsert(
                 txn, table, key_names, key_values, value_names, value_values
             )
         else:
-            return self.simple_upsert_many_txn_emulated(
+            return await self.simple_upsert_many_txn_emulated(
                 txn,
                 table,
                 key_names,
@@ -1698,7 +1758,7 @@ class DatabasePool:
                 value_values,
             )
 
-    def simple_upsert_many_txn_emulated(
+    async def simple_upsert_many_txn_emulated(
         self,
         txn: LoggingTransaction,
         table: str,
@@ -1728,10 +1788,10 @@ class DatabasePool:
             _keys = dict(zip(key_names, keyv))
             _vals = dict(zip(value_names, valv))
 
-            self.simple_upsert_txn_emulated(txn, table, _keys, _vals, lock=False)
+            await self.simple_upsert_txn_emulated(txn, table, _keys, _vals, lock=False)
 
     @staticmethod
-    def simple_upsert_many_txn_native_upsert(
+    async def simple_upsert_many_txn_native_upsert(
         txn: LoggingTransaction,
         table: str,
         key_names: Collection[str],
@@ -1776,7 +1836,8 @@ class DatabasePool:
                 latter,
             )
 
-            txn.execute_values(sql, args, fetch=False)
+            await txn.execute_values(sql, args, fetch=False)
+            return None
 
             # TODO Maybe improve for psycopg.
 
@@ -1789,7 +1850,7 @@ class DatabasePool:
                 latter,
             )
 
-            return txn.execute_batch(sql, args)
+            return await txn.execute_batch(sql, args)
 
     @overload
     async def simple_select_one(
@@ -1891,7 +1952,7 @@ class DatabasePool:
 
     @overload
     @classmethod
-    def simple_select_one_onecol_txn(
+    async def simple_select_one_onecol_txn(
         cls,
         txn: LoggingTransaction,
         table: str,
@@ -1902,7 +1963,7 @@ class DatabasePool:
 
     @overload
     @classmethod
-    def simple_select_one_onecol_txn(
+    async def simple_select_one_onecol_txn(
         cls,
         txn: LoggingTransaction,
         table: str,
@@ -1912,7 +1973,7 @@ class DatabasePool:
     ) -> Any | None: ...
 
     @classmethod
-    def simple_select_one_onecol_txn(
+    async def simple_select_one_onecol_txn(
         cls,
         txn: LoggingTransaction,
         table: str,
@@ -1920,7 +1981,7 @@ class DatabasePool:
         retcol: str,
         allow_none: bool = False,
     ) -> Any | None:
-        ret = cls.simple_select_onecol_txn(
+        ret = await cls.simple_select_onecol_txn(
             txn, table=table, keyvalues=keyvalues, retcol=retcol
         )
 
@@ -1933,7 +1994,7 @@ class DatabasePool:
                 raise StoreError(404, "No row found")
 
     @staticmethod
-    def simple_select_onecol_txn(
+    async def simple_select_onecol_txn(
         txn: LoggingTransaction,
         table: str,
         keyvalues: dict[str, Any],
@@ -1943,11 +2004,11 @@ class DatabasePool:
 
         if keyvalues:
             sql += " WHERE %s" % " AND ".join("%s = ?" % k for k in keyvalues.keys())
-            txn.execute(sql, list(keyvalues.values()))
+            await txn.execute(sql, list(keyvalues.values()))
         else:
-            txn.execute(sql)
+            await txn.execute(sql)
 
-        return [r[0] for r in txn]
+        return [r[0] async for r in txn]
 
     async def simple_select_onecol(
         self,
@@ -2008,7 +2069,7 @@ class DatabasePool:
         )
 
     @classmethod
-    def simple_select_list_txn(
+    async def simple_select_list_txn(
         cls,
         txn: LoggingTransaction,
         table: str,
@@ -2035,12 +2096,12 @@ class DatabasePool:
                 table,
                 " AND ".join("%s = ?" % (k,) for k in keyvalues),
             )
-            txn.execute(sql, list(keyvalues.values()))
+            await txn.execute(sql, list(keyvalues.values()))
         else:
             sql = "SELECT %s FROM %s" % (", ".join(retcols), table)
-            txn.execute(sql)
+            await txn.execute(sql)
 
-        return txn.fetchall()
+        return await txn.fetchall()
 
     async def simple_select_many_batch(
         self,
@@ -2090,7 +2151,7 @@ class DatabasePool:
         return results
 
     @classmethod
-    def simple_select_many_txn(
+    async def simple_select_many_txn(
         cls,
         txn: LoggingTransaction,
         table: str,
@@ -2132,8 +2193,8 @@ class DatabasePool:
             " AND ".join(clauses),
         )
 
-        txn.execute(sql, values)
-        return txn.fetchall()
+        await txn.execute(sql, values)
+        return await txn.fetchall()
 
     async def simple_update(
         self,
@@ -2160,7 +2221,7 @@ class DatabasePool:
         )
 
     @staticmethod
-    def simple_update_txn(
+    async def simple_update_txn(
         txn: LoggingTransaction,
         table: str,
         keyvalues: Mapping[str, Any],
@@ -2190,7 +2251,9 @@ class DatabasePool:
             where,
         )
 
-        txn.execute(update_sql, list(updatevalues.values()) + list(keyvalues.values()))
+        await txn.execute(
+            update_sql, list(updatevalues.values()) + list(keyvalues.values())
+        )
 
         return txn.rowcount
 
@@ -2226,7 +2289,7 @@ class DatabasePool:
         )
 
     @staticmethod
-    def simple_update_many_txn(
+    async def simple_update_many_txn(
         txn: LoggingTransaction,
         table: str,
         key_names: Collection[str],
@@ -2270,7 +2333,7 @@ class DatabasePool:
         # UPDATE mytable SET col1 = ?, col2 = ? WHERE col3 = ? AND col4 = ?
         sql = f"UPDATE {table} SET {set_clause} {where_clause}"
 
-        txn.execute_batch(sql, args)
+        await txn.execute_batch(sql, args)
 
     async def simple_update_one(
         self,
@@ -2314,7 +2377,7 @@ class DatabasePool:
 
     @overload
     @staticmethod
-    def simple_select_one_txn(
+    async def simple_select_one_txn(
         txn: LoggingTransaction,
         table: str,
         keyvalues: dict[str, Any],
@@ -2324,7 +2387,7 @@ class DatabasePool:
 
     @overload
     @staticmethod
-    def simple_select_one_txn(
+    async def simple_select_one_txn(
         txn: LoggingTransaction,
         table: str,
         keyvalues: dict[str, Any],
@@ -2333,7 +2396,7 @@ class DatabasePool:
     ) -> tuple[Any, ...] | None: ...
 
     @staticmethod
-    def simple_select_one_txn(
+    async def simple_select_one_txn(
         txn: LoggingTransaction,
         table: str,
         keyvalues: dict[str, Any],
@@ -2344,11 +2407,11 @@ class DatabasePool:
 
         if keyvalues:
             select_sql += " WHERE %s" % (" AND ".join("%s = ?" % k for k in keyvalues),)
-            txn.execute(select_sql, list(keyvalues.values()))
+            await txn.execute(select_sql, list(keyvalues.values()))
         else:
-            txn.execute(select_sql)
+            await txn.execute(select_sql)
 
-        row = txn.fetchone()
+        row = await txn.fetchone()
 
         if not row:
             if allow_none:
@@ -2379,7 +2442,7 @@ class DatabasePool:
         )
 
     @staticmethod
-    def simple_delete_one_txn(
+    async def simple_delete_one_txn(
         txn: LoggingTransaction, table: str, keyvalues: dict[str, Any]
     ) -> None:
         """Executes a DELETE query on the named table, expecting to delete a
@@ -2394,7 +2457,7 @@ class DatabasePool:
             " AND ".join("%s = ?" % (k,) for k in keyvalues),
         )
 
-        txn.execute(sql, list(keyvalues.values()))
+        await txn.execute(sql, list(keyvalues.values()))
         if txn.rowcount == 0:
             raise StoreError(404, "No row found (%s)" % (table,))
         if txn.rowcount > 1:
@@ -2420,7 +2483,7 @@ class DatabasePool:
         )
 
     @staticmethod
-    def simple_delete_txn(
+    async def simple_delete_txn(
         txn: LoggingTransaction, table: str, keyvalues: dict[str, Any]
     ) -> int:
         """Executes a DELETE query on the named table.
@@ -2439,7 +2502,7 @@ class DatabasePool:
             " AND ".join("%s = ?" % (k,) for k in keyvalues),
         )
 
-        txn.execute(sql, list(keyvalues.values()))
+        await txn.execute(sql, list(keyvalues.values()))
         return txn.rowcount
 
     async def simple_delete_many(
@@ -2476,7 +2539,7 @@ class DatabasePool:
         )
 
     @staticmethod
-    def simple_delete_many_txn(
+    async def simple_delete_many_txn(
         txn: LoggingTransaction,
         table: str,
         column: str,
@@ -2512,12 +2575,12 @@ class DatabasePool:
             values.append(value)
 
         sql = "DELETE FROM %s WHERE %s" % (table, " AND ".join(clauses))
-        txn.execute(sql, values)
+        await txn.execute(sql, values)
 
         return txn.rowcount
 
     @staticmethod
-    def simple_delete_many_batch_txn(
+    async def simple_delete_many_batch_txn(
         txn: LoggingTransaction,
         table: str,
         keys: Collection[str],
@@ -2543,7 +2606,7 @@ class DatabasePool:
                 ", ".join(k for k in keys),
             )
 
-            txn.execute_values(sql, values, fetch=False)
+            await txn.execute_values(sql, values, fetch=False)
         else:
             sql = "DELETE FROM %s WHERE (%s) = (%s)" % (
                 table,
@@ -2551,9 +2614,9 @@ class DatabasePool:
                 ", ".join("?" for _ in keys),
             )
 
-            txn.execute_batch(sql, values)
+            await txn.execute_batch(sql, values)
 
-    def get_cache_dict(
+    async def get_cache_dict(
         self,
         db_conn: LoggingDatabaseConnection,
         table: str,
@@ -2581,16 +2644,16 @@ class DatabasePool:
             LIMIT ?
         """
 
-        txn = db_conn.cursor(txn_name="get_cache_dict")
-        txn.execute(sql, (limit,))
+        txn = await db_conn.cursor(txn_name="get_cache_dict")
+        await txn.execute(sql, (limit,))
 
         # The rows come out in reverse stream ID order, so we want to keep the
         # stream ID of the first row for each entity.
         cache: dict[Any, int] = {}
-        for row in txn:
+        async for row in txn:
             cache.setdefault(row[0], int(row[1]))
 
-        txn.close()
+        await txn.close()
 
         if cache:
             # We add one here as we don't know if we have all rows for the
@@ -2602,7 +2665,7 @@ class DatabasePool:
         return cache, min_val
 
     @classmethod
-    def simple_select_list_paginate_txn(
+    async def simple_select_list_paginate_txn(
         cls,
         txn: LoggingTransaction,
         table: str,
@@ -2668,9 +2731,9 @@ class DatabasePool:
             orderby,
             order_direction,
         )
-        txn.execute(sql, arg_list + [limit, start])
+        await txn.execute(sql, arg_list + [limit, start])
 
-        return txn.fetchall()
+        return await txn.fetchall()
 
 
 def make_in_list_sql_clause(

@@ -1110,9 +1110,9 @@ class RefreshAuthTests(unittest.HomeserverTestCase):
             For testing only; trivially vulnerable to SQL injection.
             """
 
-            def _txn(txn: LoggingTransaction) -> int:
-                txn.execute(f"SELECT COUNT(1) FROM {table_name}")
-                row = txn.fetchone()
+            async def _txn(txn: LoggingTransaction) -> int:
+                await txn.execute(f"SELECT COUNT(1) FROM {table_name}")
+                row = await txn.fetchone()
                 # Query is infallible
                 assert row is not None
                 return row[0]

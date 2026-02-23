@@ -19,8 +19,8 @@
 #
 #
 
-from typing import Callable
-from unittest.mock import Mock, call, patch
+from typing import Awaitable, Callable
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import attr
 
@@ -35,6 +35,7 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_tuple_comparison_clause,
 )
+from synapse.util.async_helpers import maybe_awaitable
 from synapse.util.clock import Clock
 
 from tests import unittest
@@ -63,8 +64,8 @@ class ExecuteScriptTestCase(unittest.HomeserverTestCase):
     def test_transaction(self) -> None:
         """Test that all statements are run in a single transaction."""
 
-        def run(conn: LoggingDatabaseConnection) -> None:
-            cur = conn.cursor(txn_name="test_transaction")
+        async def run(conn: LoggingDatabaseConnection) -> None:
+            cur = await conn.cursor(txn_name="test_transaction")
             self.db_pool.engine.executescript(
                 cur,
                 ";".join(
@@ -97,12 +98,12 @@ class ExecuteScriptTestCase(unittest.HomeserverTestCase):
     def test_commit(self) -> None:
         """Test that the script transaction remains open and can be committed."""
 
-        def run(conn: LoggingDatabaseConnection) -> None:
-            cur = conn.cursor(txn_name="test_commit")
+        async def run(conn: LoggingDatabaseConnection) -> None:
+            cur = await conn.cursor(txn_name="test_commit")
             self.db_pool.engine.executescript(
                 cur, "INSERT INTO foo (name) VALUES ('commit test')"
             )
-            cur.execute("COMMIT")
+            await cur.execute("COMMIT")
 
         self.get_success(self.db_pool.runWithConnection(run))
 
@@ -120,12 +121,12 @@ class ExecuteScriptTestCase(unittest.HomeserverTestCase):
     def test_rollback(self) -> None:
         """Test that the script transaction remains open and can be rolled back."""
 
-        def run(conn: LoggingDatabaseConnection) -> None:
-            cur = conn.cursor(txn_name="test_rollback")
+        async def run(conn: LoggingDatabaseConnection) -> None:
+            cur = await conn.cursor(txn_name="test_rollback")
             self.db_pool.engine.executescript(
                 cur, "INSERT INTO foo (name) VALUES ('rollback test')"
             )
-            cur.execute("ROLLBACK")
+            await cur.execute("ROLLBACK")
 
         self.get_success(self.db_pool.runWithConnection(run))
 
@@ -146,8 +147,8 @@ class ExecuteScriptTestCase(unittest.HomeserverTestCase):
 class TransactionMocks:
     after_callback: Mock
     exception_callback: Mock
-    commit: Mock
-    rollback: Mock
+    commit: AsyncMock
+    rollback: AsyncMock
 
 
 class CallbacksTestCase(unittest.HomeserverTestCase):
@@ -158,7 +159,7 @@ class CallbacksTestCase(unittest.HomeserverTestCase):
         self.db_pool: DatabasePool = self.store.db_pool
 
     def _run_interaction(
-        self, func: Callable[[LoggingTransaction], object]
+        self, func: Callable[[LoggingTransaction], Awaitable[object]]
     ) -> TransactionMocks:
         """Run the given function in a database transaction, with callbacks registered.
 
@@ -176,13 +177,13 @@ class CallbacksTestCase(unittest.HomeserverTestCase):
         # Track commit/rollback calls on the LoggingDatabaseConnection used
         # for the transaction so tests can assert whether attempts committed
         # or rolled back.
-        commit_mock = Mock()
-        rollback_mock = Mock()
+        commit_mock = AsyncMock()
+        rollback_mock = AsyncMock()
 
-        def _test_txn(txn: LoggingTransaction) -> None:
+        async def _test_txn(txn: LoggingTransaction) -> None:
             txn.call_after(after_callback, 123, 456, extra=789)
             txn.call_on_exception(exception_callback, 987, 654, extra=321)
-            func(txn)
+            await func(txn)
 
         # Wrap the real commit/rollback so we record calls but still perform
         # the original behaviour.
@@ -191,15 +192,15 @@ class CallbacksTestCase(unittest.HomeserverTestCase):
 
         # type-ignore becauase we're just transparently passing through args/kwargs and
         # returning whatever result that the original function does
-        def _commit(self, *a, **kw):  # type: ignore[no-untyped-def]
-            commit_mock()
-            return orig_commit(self, *a, **kw)
+        async def _commit(self, *a, **kw):  # type: ignore[no-untyped-def]
+            await commit_mock()
+            return await orig_commit(self, *a, **kw)
 
         # type-ignore becauase we're just transparently passing through args/kwargs and
         # returning whatever result that the original function does
-        def _rollback(self, *a, **kw):  # type: ignore[no-untyped-def]
-            rollback_mock()
-            return orig_rollback(self, *a, **kw)
+        async def _rollback(self, *a, **kw):  # type: ignore[no-untyped-def]
+            await rollback_mock()
+            return await orig_rollback(self, *a, **kw)
 
         try:
             with (
@@ -231,7 +232,9 @@ class CallbacksTestCase(unittest.HomeserverTestCase):
 
     def test_after_callback(self) -> None:
         """Test that the after callback is called when a transaction succeeds."""
-        txn_mocks = self._run_interaction(lambda txn: None)
+        async def _txn(conn: LoggingTransaction) -> None:
+            return
+        txn_mocks = self._run_interaction(_txn)
 
         txn_mocks.after_callback.assert_called_once_with(123, 456, extra=789)
         txn_mocks.exception_callback.assert_not_called()
@@ -243,7 +246,7 @@ class CallbacksTestCase(unittest.HomeserverTestCase):
 
     def test_exception_callback(self) -> None:
         """Test that the exception callback is called when a transaction fails."""
-        _test_txn = Mock(side_effect=ZeroDivisionError)
+        _test_txn = AsyncMock(side_effect=ZeroDivisionError)
         txn_mocks = self._run_interaction(_test_txn)
 
         txn_mocks.after_callback.assert_not_called()
@@ -258,7 +261,7 @@ class CallbacksTestCase(unittest.HomeserverTestCase):
     def test_failed_retry(self) -> None:
         """Test that the exception callback is called for every failed attempt."""
         # Always raise an `OperationalError`.
-        _test_txn = Mock(side_effect=self.db_pool.engine.module.OperationalError)
+        _test_txn = AsyncMock(side_effect=self.db_pool.engine.module.OperationalError)
         txn_mocks = self._run_interaction(_test_txn)
 
         txn_mocks.after_callback.assert_not_called()
@@ -282,7 +285,7 @@ class CallbacksTestCase(unittest.HomeserverTestCase):
     def test_successful_retry(self) -> None:
         """Test callbacks for a failed transaction followed by a successful attempt."""
         # Raise an `OperationalError` on the first attempt only.
-        _test_txn = Mock(
+        _test_txn = AsyncMock(
             side_effect=[self.db_pool.engine.module.OperationalError, None]
         )
         txn_mocks = self._run_interaction(_test_txn)
@@ -317,7 +320,7 @@ class CancellationTestCase(unittest.HomeserverTestCase):
         after_callback = Mock()
         exception_callback = Mock()
 
-        def _test_txn(txn: LoggingTransaction) -> None:
+        async def _test_txn(txn: LoggingTransaction) -> None:
             txn.call_after(after_callback, 123, 456, extra=789)
             txn.call_on_exception(exception_callback, 987, 654, extra=321)
             d.cancel()
@@ -336,7 +339,7 @@ class CancellationTestCase(unittest.HomeserverTestCase):
         after_callback = Mock()
         exception_callback = Mock()
 
-        def _test_txn(txn: LoggingTransaction) -> None:
+        async def _test_txn(txn: LoggingTransaction) -> None:
             txn.call_after(after_callback, 123, 456, extra=789)
             txn.call_on_exception(exception_callback, 987, 654, extra=321)
             d.cancel()

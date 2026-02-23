@@ -96,11 +96,11 @@ class EndToEndKeyWorkerStoreTestCase(HomeserverTestCase):
         )
         assert timestamp is not None
 
-        def check_timestamp_column(
+        async def check_timestamp_column(
             txn: LoggingTransaction,
         ) -> list[tuple[JsonDict, int | None]]:
             """Fetch all rows for Alice's keys."""
-            txn.execute(
+            await txn.execute(
                 """
                 SELECT keydata, updatable_without_uia_before_ms
                 FROM e2e_cross_signing_keys
@@ -109,7 +109,7 @@ class EndToEndKeyWorkerStoreTestCase(HomeserverTestCase):
             """,
                 (alice,),
             )
-            return [(db_to_json(keydata), ts) for keydata, ts in txn.fetchall()]
+            return [(db_to_json(keydata), ts) for keydata, ts in await txn.fetchall()]
 
         values = self.get_success(
             self.store.db_pool.runInteraction(

@@ -23,6 +23,7 @@ from __future__ import annotations
 from types import TracebackType
 from typing import (
     Any,
+    AsyncIterator,
     Iterator,
     Mapping,
     Protocol,
@@ -200,7 +201,7 @@ class AsyncCursor(Protocol):
     def rowcount(self) -> int:
         return 0
 
-    def __aiter__(self) -> Iterator[tuple]: ...
+    def __aiter__(self) -> AsyncIterator[tuple]: ...
 
     async def close(self) -> None: ...
 

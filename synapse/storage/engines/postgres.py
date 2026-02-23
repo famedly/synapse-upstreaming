@@ -19,9 +19,10 @@
 #
 #
 
+from __future__ import annotations
 import abc
 import logging
-from typing import TYPE_CHECKING, Any, Mapping, cast
+from typing import Any, Mapping, cast
 
 from synapse.storage.engines._base import (
     AUTO_INCREMENT_PRIMARY_KEYPLACEHOLDER,
@@ -32,10 +33,9 @@ from synapse.storage.engines._base import (
     IsolationLevel,
     IsolationLevelType,
 )
-from synapse.storage.types import Cursor, DBAPI2Module
+from synapse.storage.types import AsyncDBAPI2Module, Cursor, DBAPI2Module
+from synapse.util.async_helpers import maybe_awaitable
 
-if TYPE_CHECKING:
-    from synapse.storage.database import LoggingDatabaseConnection
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ class PostgresEngine(
     isolation_level_map: Mapping[IsolationLevel, IsolationLevelType]
     default_isolation_level: IsolationLevelType
 
-    def __init__(self, module: DBAPI2Module, database_config: Mapping[str, Any]):
+    def __init__(self, module: DBAPI2Module | AsyncDBAPI2Module, database_config: Mapping[str, Any]):
         super().__init__(module, database_config)
 
         self.synchronous_commit: bool = database_config.get("synchronous_commit", True)
@@ -177,32 +177,6 @@ class PostgresEngine(
     def convert_param_style(self, sql: str) -> str:
         return sql.replace("?", "%s")
 
-    def on_new_connection(self, db_conn: "LoggingDatabaseConnection") -> None:
-        # mypy doesn't realize that ConnectionType matches the Connection protocol.
-        self.attempt_to_set_isolation_level(db_conn.conn)  # type: ignore[arg-type]
-
-        # Set the bytea output to escape, vs the default of hex
-        cursor = db_conn.cursor()
-        cursor.execute("SET bytea_output TO escape")
-
-        # Asynchronous commit, don't wait for the server to call fsync before
-        # ending the transaction.
-        # https://www.postgresql.org/docs/current/static/wal-async-commit.html
-        if not self.synchronous_commit:
-            cursor.execute("SET synchronous_commit TO OFF")
-
-        # Abort really long-running statements and turn them into errors.
-        if self.statement_timeout is not None:
-            # Because the PostgresEngine is considered an ABCMeta, a superclass and a
-            # subclass, cursor's type is messy. We know it should be a CursorType,
-            # but for now that doesn't pass cleanly through LoggingDatabaseConnection
-            # and LoggingTransaction. Fortunately, it's merely running an execute()
-            # and nothing more exotic.
-            self.set_statement_timeout(cursor.txn, self.statement_timeout)  # type: ignore[arg-type]
-
-        cursor.close()
-        db_conn.commit()
-
     @property
     def supports_using_any_list(self) -> bool:
         """Do we support using `a = ANY(?)` and passing a list"""
@@ -217,8 +191,8 @@ class PostgresEngine(
         # Both psycopg and psycopg2 connections have a closed attributed.
         return bool(conn.closed)  # type: ignore[attr-defined]
 
-    def lock_table(self, txn: Cursor, table: str) -> None:
-        txn.execute("LOCK TABLE %s in EXCLUSIVE MODE" % (table,))
+    async def lock_table(self, txn: Cursor, table: str) -> None:
+        await maybe_awaitable(txn.execute("LOCK TABLE %s in EXCLUSIVE MODE" % (table,)))
 
     @property
     def server_version(self) -> str:
