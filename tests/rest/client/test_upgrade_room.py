@@ -134,7 +134,18 @@ class UpgradeRoomTest(unittest.HomeserverTestCase):
             "m.room.power_levels",
             tok=self.creator_token,
         )
-        power_levels["users"][self.other] = 100
+        # In the Matrix Spec v1.16, m.room.tombstone events are only mentioned in
+        # respect to /createRoom:
+        # > If the room’s version is 12 or higher, the power level for sending
+        #   `m.room.tombstone` events MUST explicitly be higher than `state_default`.
+        #   For example, set to 150 instead of 100.
+        # In the spec proposal for msc4289 is where it is mentioned that tombstone
+        # `power_levels` should always be higher than `state_default`, so that attribute
+        # is what we use to tweak this 'other' user to enable upgrading a room.
+        if self.hs.config.server.default_room_version.msc4289_creator_power_enabled:
+            power_levels["users"][self.other] = 150
+        else:
+            power_levels["users"][self.other] = 100
         self.helper.send_state(
             self.room_id,
             "m.room.power_levels",
@@ -160,7 +171,18 @@ class UpgradeRoomTest(unittest.HomeserverTestCase):
             "m.room.power_levels",
             tok=self.creator_token,
         )
-        power_levels["users_default"] = 100
+        # In the Matrix Spec v1.16, m.room.tombstone events are only mentioned in
+        # respect to /createRoom:
+        # > If the room’s version is 12 or higher, the power level for sending
+        #   `m.room.tombstone` events MUST explicitly be higher than `state_default`.
+        #   For example, set to 150 instead of 100.
+        # In the spec proposal for msc4289 is where it is mentioned that tombstone
+        # `power_levels` should always be higher than `state_default`, so that attribute
+        # is what we use to tweak this 'other' user to enable upgrading a room.
+        if self.hs.config.server.default_room_version.msc4289_creator_power_enabled:
+            power_levels["users"][self.other] = 150
+        else:
+            power_levels["users"][self.other] = 100
         self.helper.send_state(
             self.room_id,
             "m.room.power_levels",
