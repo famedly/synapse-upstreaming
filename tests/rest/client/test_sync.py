@@ -492,29 +492,35 @@ class UnreadMessagesTestCase(unittest.HomeserverTestCase):
 
         # Change the power levels of the room so that the second user can send state
         # events.
+        power_levels_event_source: JsonDict = {
+            "users": {self.user_id: 100, self.user2: 100},
+            "users_default": 0,
+            "events": {
+                "m.room.name": 50,
+                "m.room.power_levels": 100,
+                "m.room.history_visibility": 100,
+                "m.room.canonical_alias": 50,
+                "m.room.avatar": 50,
+                "m.room.tombstone": 100,
+                "m.room.server_acl": 100,
+                "m.room.encryption": 100,
+            },
+            "events_default": 0,
+            "state_default": 50,
+            "ban": 50,
+            "kick": 50,
+            "redact": 50,
+            "invite": 0,
+        }
+        # The 'users' property in power_levels events can not have the room
+        # creator if the room supports msc4289
+        if self.hs.config.server.default_room_version.msc4289_creator_power_enabled:
+            power_levels_event_source["users"].pop(self.user_id)
+
         self.helper.send_state(
             self.room_id,
             EventTypes.PowerLevels,
-            {
-                "users": {self.user_id: 100, self.user2: 100},
-                "users_default": 0,
-                "events": {
-                    "m.room.name": 50,
-                    "m.room.power_levels": 100,
-                    "m.room.history_visibility": 100,
-                    "m.room.canonical_alias": 50,
-                    "m.room.avatar": 50,
-                    "m.room.tombstone": 100,
-                    "m.room.server_acl": 100,
-                    "m.room.encryption": 100,
-                },
-                "events_default": 0,
-                "state_default": 50,
-                "ban": 50,
-                "kick": 50,
-                "redact": 50,
-                "invite": 0,
-            },
+            power_levels_event_source,
             tok=self.tok,
         )
 
