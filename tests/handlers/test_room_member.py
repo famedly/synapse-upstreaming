@@ -8,13 +8,13 @@ import synapse.rest.client.room
 from synapse.api.constants import AccountDataTypes, EventTypes, Membership
 from synapse.api.errors import Codes, LimitExceededError, SynapseError
 from synapse.crypto.event_signing import add_hashes_and_signatures
-from synapse.events import FrozenEventV3
+from synapse.events import make_event_from_dict
 from synapse.federation.federation_base import (
     event_from_pdu_json,
 )
 from synapse.federation.federation_client import SendJoinResult
 from synapse.server import HomeServer
-from synapse.types import UserID, create_requester
+from synapse.types import JsonDict, UserID, create_requester
 from synapse.util.clock import Clock
 
 from tests.replication._base import BaseMultiWorkerStreamTestCase
@@ -45,7 +45,7 @@ class TestJoinsLimitedByPerRoomRateLimiter(FederatingHomeserverTestCase):
         self.chris_token = self.login("chris", "pass")
 
         # Create a room on this homeserver. Note that this counts as a join: it
-        # contributes to the rate limter's count of actions
+        # contributes to the rate limiter's count of actions
         self.room_id = self.helper.create_room_as(self.alice, tok=self.alice_token)
 
         self.intially_unjoined_room_id = f"!example:{self.OTHER_SERVER_NAME}"
@@ -108,7 +108,7 @@ class TestJoinsLimitedByPerRoomRateLimiter(FederatingHomeserverTestCase):
         # We also patch out a bunch of event checks on our end. All we're really
         # trying to check here is that remote joins will bump the rate limter when
         # they are persisted.
-        create_event_source = {
+        create_event_source: JsonDict = {
             "auth_events": [],
             "content": {
                 "creator": f"@creator:{self.OTHER_SERVER_NAME}",
@@ -122,11 +122,14 @@ class TestJoinsLimitedByPerRoomRateLimiter(FederatingHomeserverTestCase):
             "state_key": "",
             "type": EventTypes.Create,
         }
+        if self.hs.config.server.default_room_version.implicit_room_creator:
+            create_event_source["content"].pop("creator")
+
         self.add_hashes_and_signatures_from_other_server(
             create_event_source,
             self.hs.config.server.default_room_version,
         )
-        create_event = FrozenEventV3(
+        create_event = make_event_from_dict(
             create_event_source,
             self.hs.config.server.default_room_version,
             {},
@@ -150,7 +153,7 @@ class TestJoinsLimitedByPerRoomRateLimiter(FederatingHomeserverTestCase):
             self.hs.hostname,
             self.hs.signing_key,
         )
-        join_event = FrozenEventV3(
+        join_event = make_event_from_dict(
             join_event_source,
             self.hs.config.server.default_room_version,
             {},
