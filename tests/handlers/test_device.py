@@ -33,10 +33,9 @@ from twisted.internet.testing import MemoryReactor
 
 from synapse.api.constants import EventTypes, JoinRules, RoomEncryptionAlgorithms
 from synapse.api.errors import NotFoundError, SynapseError
-from synapse.api.room_versions import RoomVersions
 from synapse.appservice import ApplicationService
 from synapse.crypto.event_signing import add_hashes_and_signatures
-from synapse.events import EventBase, FrozenEventV3
+from synapse.events import EventBase, make_event_from_dict
 from synapse.federation.federation_client import SendJoinResult
 from synapse.federation.transport.client import (
     StateRequestResponse,
@@ -649,8 +648,7 @@ class DeviceUnPartialStateTestCase(unittest.HomeserverTestCase):
     def _build_public_room(self) -> StateMap[EventBase]:
         """Build a public room DAG that has REMOTE1 in it"""
 
-        room_id = f"!room:{self.REMOTE1_SERVER_NAME}"
-        room_version = RoomVersions.V10
+        room_version = self.hs.config.server.default_room_version
 
         events: list[EventBase] = []
 
@@ -661,14 +659,22 @@ class DeviceUnPartialStateTestCase(unittest.HomeserverTestCase):
                 "creator": self.REMOTE1_USER,
                 "room_version": room_version.identifier,
             },
-            "depth": 0,
+            "depth": 1,
             "origin_server_ts": 0,
             "prev_events": [],
-            "room_id": room_id,
             "sender": self.REMOTE1_USER,
             "state_key": "",
             "type": EventTypes.Create,
         }
+
+        if room_version.implicit_room_creator:
+            create_event_dict["content"].pop("creator")
+
+        if not room_version.msc4291_room_ids_as_hashes:
+            # msc4291 rooms generate the room_id from the hash of the event. If it is
+            # not such a room, create a room_id to use. Extract it below after the hash
+            # may have been calculated.
+            create_event_dict["room_id"] = f"!room:{self.REMOTE1_SERVER_NAME}"
 
         add_hashes_and_signatures(
             room_version,
@@ -677,16 +683,17 @@ class DeviceUnPartialStateTestCase(unittest.HomeserverTestCase):
             self.REMOTE1_SERVER_SIGNATURE_KEY,
         )
 
-        create_event = FrozenEventV3(create_event_dict, room_version, {}, None)
+        create_event = make_event_from_dict(create_event_dict, room_version, {}, None)
+        # This will always be the correct room_id
+        room_id = create_event.room_id
         events.append(create_event)
 
-        room_version = self.hs.config.server.default_room_version
         join_event_dict: JsonDict = {
             "auth_events": [
                 create_event.event_id,
             ],
             "content": {"membership": "join"},
-            "depth": 1,
+            "depth": 2,
             "origin_server_ts": 100,
             "prev_events": [create_event.event_id],
             "sender": self.REMOTE1_USER,
@@ -694,20 +701,25 @@ class DeviceUnPartialStateTestCase(unittest.HomeserverTestCase):
             "room_id": room_id,
             "type": EventTypes.Member,
         }
+
+        if room_version.msc4291_room_ids_as_hashes:
+            # msc4291 rooms do not have the creation event in their auth_events
+            join_event_dict["auth_events"].remove(create_event.event_id)
+
         add_hashes_and_signatures(
             room_version,
             join_event_dict,
             self.hs.hostname,
             self.hs.signing_key,
         )
-        join_event = FrozenEventV3(join_event_dict, room_version, {}, None)
+        join_event = make_event_from_dict(join_event_dict, room_version, {}, None)
         events.append(join_event)
 
         # Then set the join rules to public
         join_rules_event_dict: JsonDict = {
             "auth_events": [create_event.event_id, join_event.event_id],
             "content": {"join_rule": JoinRules.PUBLIC},
-            "depth": 2,
+            "depth": 3,
             "origin_server_ts": 200,
             "prev_events": [join_event.event_id],
             "room_id": room_id,
@@ -716,13 +728,19 @@ class DeviceUnPartialStateTestCase(unittest.HomeserverTestCase):
             "type": EventTypes.JoinRules,
         }
 
+        if room_version.msc4291_room_ids_as_hashes:
+            # msc4291 rooms do not have the creation event in their auth_events
+            join_rules_event_dict["auth_events"].remove(create_event.event_id)
+
         add_hashes_and_signatures(
             room_version,
             join_rules_event_dict,
             self.REMOTE1_SERVER_NAME,
             self.REMOTE1_SERVER_SIGNATURE_KEY,
         )
-        join_rules_event = FrozenEventV3(join_rules_event_dict, room_version, {}, None)
+        join_rules_event = make_event_from_dict(
+            join_rules_event_dict, room_version, {}, None
+        )
         events.append(join_rules_event)
 
         return {(event.type, event.state_key): event for event in events}
@@ -733,7 +751,7 @@ class DeviceUnPartialStateTestCase(unittest.HomeserverTestCase):
         user: str,
         signing_key: SigningKey,
         state: StateMap[EventBase],
-    ) -> FrozenEventV3:
+    ) -> EventBase:
         """Build a join event for the local user, signed by the local server."""
 
         latest_event = max(state.values(), key=lambda e: e.depth)
@@ -753,13 +771,18 @@ class DeviceUnPartialStateTestCase(unittest.HomeserverTestCase):
             "room_id": room_id,
             "type": EventTypes.Member,
         }
+        if room_version.msc4291_room_ids_as_hashes:
+            # msc4291 rooms do not have the creation event in their auth_events
+            join_event_dict["auth_events"].remove(
+                state[(EventTypes.Create, "")].event_id
+            )
         add_hashes_and_signatures(
             room_version,
             join_event_dict,
             get_domain_from_id(user),
             signing_key,
         )
-        return FrozenEventV3(join_event_dict, room_version, {}, None)
+        return make_event_from_dict(join_event_dict, room_version, {}, None)
 
     @parameterized.expand([("not_pruned", False), ("pruned", True)])
     @patch(
@@ -773,7 +796,7 @@ class DeviceUnPartialStateTestCase(unittest.HomeserverTestCase):
         partial state period should be sent to remote servers that were NOT
         known at the time of the partial join.
 
-        We do this by creating a room with one remote server, partialling
+        We do this by creating a room with one remote server, partially
         joining it, then receiving a join event from a second remote server. The
         second remote server should receive a device list update EDU for any
         local device changes that happened during the partial state period.
