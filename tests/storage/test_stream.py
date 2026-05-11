@@ -684,17 +684,23 @@ class GetCurrentStateDeltaMembershipChangesForUserTestCase(HomeserverTestCase):
 
         before_room1_token = self.event_sources.get_current_token()
 
+        power_level_content_override = {
+            "users": {
+                user2_id: 100,
+                # Allow user1 to send state in the room
+                user1_id: 100,
+            }
+        }
+        if self.hs.config.server.default_room_version.msc4289_creator_power_enabled:
+            # Room version 12 does not allow room creator power level adjustments in
+            # the power level event, so just remove it here
+            power_level_content_override["users"].pop(user2_id)
+
         room_id1 = self.helper.create_room_as(
             user2_id,
             tok=user2_tok,
             extra_content={
-                "power_level_content_override": {
-                    "users": {
-                        user2_id: 100,
-                        # Allow user1 to send state in the room
-                        user1_id: 100,
-                    }
-                }
+                "power_level_content_override": power_level_content_override
             },
         )
         join_response1 = self.helper.join(room_id1, user1_id, tok=user1_tok)
@@ -855,17 +861,23 @@ class GetCurrentStateDeltaMembershipChangesForUserTestCase(HomeserverTestCase):
 
         before_room1_token = self.event_sources.get_current_token()
 
+        power_level_content_override = {
+            "users": {
+                user2_id: 100,
+                # Allow user1 to send state in the room
+                user1_id: 100,
+            }
+        }
+        if self.hs.config.server.default_room_version.msc4289_creator_power_enabled:
+            # Room version 12 does not allow room creator power level adjustments in
+            # the power level event, so just remove it here
+            power_level_content_override["users"].pop(user2_id)
+
         room_id1 = self.helper.create_room_as(
             user2_id,
             tok=user2_tok,
             extra_content={
-                "power_level_content_override": {
-                    "users": {
-                        user2_id: 100,
-                        # Allow user1 to send state in the room
-                        user1_id: 100,
-                    }
-                }
+                "power_level_content_override": power_level_content_override
             },
         )
         join_response1 = self.helper.join(room_id1, user1_id, tok=user1_tok)
