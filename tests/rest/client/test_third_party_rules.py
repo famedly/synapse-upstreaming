@@ -552,29 +552,35 @@ class ThirdPartyRulesTestCase(unittest.FederatingHomeserverTestCase):
         Args:
             event_default: Value to use for 'events_default'.
         """
+        body = {
+            "ban": 50,
+            "events": {
+                "m.room.avatar": 50,
+                "m.room.canonical_alias": 50,
+                "m.room.encryption": 100,
+                "m.room.history_visibility": 100,
+                "m.room.name": 50,
+                "m.room.power_levels": 100,
+                "m.room.server_acl": 100,
+                "m.room.tombstone": 100,
+            },
+            "events_default": event_default,
+            "invite": 0,
+            "kick": 50,
+            "redact": 50,
+            "state_default": 50,
+            "users": {self.user_id: 100},
+            "users_default": 0,
+        }
+        if self.hs.config.server.default_room_version.msc4289_creator_power_enabled:
+            # msc4289 is not allowed to have the room creator(here, self.user_id) in the
+            # power level 'users' object. Remove it for this test series
+            body.pop("users")
+
         self.helper.send_state(
             room_id=self.room_id,
             event_type=EventTypes.PowerLevels,
-            body={
-                "ban": 50,
-                "events": {
-                    "m.room.avatar": 50,
-                    "m.room.canonical_alias": 50,
-                    "m.room.encryption": 100,
-                    "m.room.history_visibility": 100,
-                    "m.room.name": 50,
-                    "m.room.power_levels": 100,
-                    "m.room.server_acl": 100,
-                    "m.room.tombstone": 100,
-                },
-                "events_default": event_default,
-                "invite": 0,
-                "kick": 50,
-                "redact": 50,
-                "state_default": 50,
-                "users": {self.user_id: 100},
-                "users_default": 0,
-            },
+            body=body,
             tok=self.tok,
         )
 
