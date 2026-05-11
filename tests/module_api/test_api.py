@@ -287,6 +287,11 @@ class ModuleApiTestCase(BaseModuleApiTestCase):
             "users_default": 0,
             "events": {"test.event.type": 25},
         }
+        if self.hs.config.server.default_room_version.msc4289_creator_power_enabled:
+            # msc4289 is not allowed to have the room creator(here, self.user_id) in the
+            # power level 'users' object. Remove it for this test series
+            content.pop("users")
+
         event_dict = {
             "room_id": room_id,
             "type": "m.room.power_levels",
@@ -758,7 +763,10 @@ class ModuleApiTestCase(BaseModuleApiTestCase):
             access_token=access_token,
         )
         self.assertEqual(channel.code, 200, channel.result)
-        self.assertEqual(channel.json_body["creator"], user_id)
+        self.assertEqual(
+            channel.json_body["room_version"],
+            self.hs.config.server.default_room_version.identifier,
+        )
 
         # Check room alias.
         self.assertEqual(room_alias, f"#foo-bar:{self.module_api.server_name}")
@@ -775,7 +783,10 @@ class ModuleApiTestCase(BaseModuleApiTestCase):
             access_token=access_token,
         )
         self.assertEqual(channel.code, 200, channel.result)
-        self.assertEqual(channel.json_body["creator"], user_id)
+        self.assertEqual(
+            channel.json_body["room_version"],
+            self.hs.config.server.default_room_version.identifier,
+        )
 
         # Check room alias.
         self.assertIsNone(room_alias)
@@ -844,7 +855,7 @@ class ModuleApiTestCase(BaseModuleApiTestCase):
         self.assertEqual(create_event.user_id, user_id)
 
         # The event supports looking up keys via `__getitem__` although deprecated
-        self.assertEqual(create_event["room_id"], room_id)
+        self.assertEqual(create_event["type"], EventTypes.Create)
 
 
 class ModuleApiWorkerTestCase(BaseModuleApiTestCase, BaseMultiWorkerStreamTestCase):
