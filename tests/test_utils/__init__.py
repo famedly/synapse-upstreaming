@@ -39,7 +39,10 @@ from twisted.web.http import RESPONSES
 from twisted.web.http_headers import Headers
 from twisted.web.iweb import IResponse
 
-from synapse.types import JsonSerializable
+from synapse.api.constants import EventContentFields, EventTypes
+from synapse.events import EventBase
+from synapse.synapse_rust.room_versions import RoomVersion
+from synapse.types import JsonDict, JsonSerializable
 from synapse.util.json import json_encoder
 
 if TYPE_CHECKING:
@@ -159,3 +162,55 @@ ERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6g4SFhoeIiYqSk5SVlp
 eYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2drh4uPk5
 ebn6Onq8fLz9PX29/j5+v/aAA4EQwBNAFkASwAAPwD3+vf69/r3+v/Z
 """)
+
+
+def forwards_compatibility_filter_out_event_keys_for_various_room_versions(
+    pdu_dict: JsonDict,
+    room_version: RoomVersion,
+    known_room_creation_event_base: EventBase | None = None,
+) -> JsonDict:
+    """
+    Given an Event dictionary, some keys are forbidden from being present for a given
+    room version. Starting at a base of room version "10", strip out keys that should
+    not be present, conditionally. This may be useful for older room versions as well
+    but that has not been tested at this time.
+
+    Returns: The pdu with the forwards compatible data removed
+    """
+    event_type = pdu_dict["type"]
+    if event_type == EventTypes.Create and room_version.implicit_room_creator:
+        # For room version "11", the "creator" is no longer a key to include in the
+        # "content" of a room creation event, as it was replaced by the "sender" of the
+        # event. Strip it out for this room version.
+        pdu_dict.get("content", {}).pop("creator", None)
+    if room_version.msc4291_room_ids_as_hashes:
+        # Room version "12" brought:
+        # * using room_ids as hashes instead using a provided value
+        # * the room creation event_id is no longer allowed in auth_events
+        if event_type == EventTypes.Create:
+            pdu_dict.pop("room_id", None)
+
+        if (
+            known_room_creation_event_base
+            and event_type != EventTypes.Create
+            and known_room_creation_event_base.event_id in pdu_dict["auth_events"]
+        ):
+            pdu_dict["auth_events"].remove(known_room_creation_event_base.event_id)
+
+    if room_version.msc4289_creator_power_enabled:
+        # Room version "12" also brought:
+        # * the room's creator has infinite power level, so is not allowed in the
+        #   'users' object of a power level event
+        # * "additional_creators" are also forbidden from being present
+        if event_type == EventTypes.PowerLevels and known_room_creation_event_base:
+            infinite_power_level_users = [known_room_creation_event_base.sender]
+            infinite_power_level_users.extend(
+                known_room_creation_event_base.content.get(
+                    EventContentFields.ADDITIONAL_CREATORS, []
+                )
+            )
+            users_object = pdu_dict.get("content", {}).get("users", {})
+            for user in infinite_power_level_users:
+                users_object.pop(user, None)
+
+    return pdu_dict
