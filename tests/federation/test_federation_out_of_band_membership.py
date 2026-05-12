@@ -32,7 +32,7 @@ from parameterized import parameterized
 from twisted.internet.testing import MemoryReactor
 
 from synapse.api.constants import EventContentFields, EventTypes, Membership
-from synapse.api.room_versions import RoomVersion, RoomVersions
+from synapse.api.room_versions import RoomVersion
 from synapse.events import EventBase, make_event_from_dict
 from synapse.events.utils import strip_event
 from synapse.federation.federation_base import (
@@ -53,6 +53,9 @@ from synapse.types.handlers.sliding_sync import (
 from synapse.util.clock import Clock
 
 from tests import unittest
+from tests.test_utils import (
+    forwards_compatibility_filter_out_event_keys_for_various_room_versions,
+)
 from tests.utils import test_timeout
 
 logger = logging.getLogger(__name__)
@@ -192,44 +195,52 @@ class OutOfBandMembershipTests(unittest.FederatingHomeserverTestCase):
 
         # Create a remote room
         room_creator_user_id = f"@remote-user:{self.OTHER_SERVER_NAME}"
-        remote_room_id = f"!remote-room:{self.OTHER_SERVER_NAME}"
-        room_version = RoomVersions.V10
+        room_version = self.hs.config.server.default_room_version
 
         room_create_event = make_event_from_dict(
             self.add_hashes_and_signatures_from_other_server(
-                {
-                    "room_id": remote_room_id,
-                    "sender": room_creator_user_id,
-                    "depth": 1,
-                    "origin_server_ts": 1,
-                    "type": EventTypes.Create,
-                    "state_key": "",
-                    "content": {
-                        # The `ROOM_CREATOR` field could be removed if we used a room
-                        # version > 10 (in favor of relying on `sender`)
-                        EventContentFields.ROOM_CREATOR: room_creator_user_id,
-                        EventContentFields.ROOM_VERSION: room_version.identifier,
+                forwards_compatibility_filter_out_event_keys_for_various_room_versions(
+                    {
+                        "room_id": f"!remote-room:{self.OTHER_SERVER_NAME}",
+                        "sender": room_creator_user_id,
+                        "depth": 1,
+                        "origin_server_ts": 1,
+                        "type": EventTypes.Create,
+                        "state_key": "",
+                        "content": {
+                            # The `ROOM_CREATOR` field could be removed if we used a room
+                            # version > 10 (in favor of relying on `sender`)
+                            EventContentFields.ROOM_CREATOR: room_creator_user_id,
+                            EventContentFields.ROOM_VERSION: room_version.identifier,
+                        },
+                        "auth_events": [],
+                        "prev_events": [],
                     },
-                    "auth_events": [],
-                    "prev_events": [],
-                }
+                    room_version,
+                )
             ),
             room_version=room_version,
         )
 
+        remote_room_id = room_create_event.room_id
+
         creator_membership_event = make_event_from_dict(
             self.add_hashes_and_signatures_from_other_server(
-                {
-                    "room_id": remote_room_id,
-                    "sender": room_creator_user_id,
-                    "depth": 2,
-                    "origin_server_ts": 2,
-                    "type": EventTypes.Member,
-                    "state_key": room_creator_user_id,
-                    "content": {"membership": Membership.JOIN},
-                    "auth_events": [room_create_event.event_id],
-                    "prev_events": [room_create_event.event_id],
-                }
+                forwards_compatibility_filter_out_event_keys_for_various_room_versions(
+                    {
+                        "room_id": remote_room_id,
+                        "sender": room_creator_user_id,
+                        "depth": 2,
+                        "origin_server_ts": 2,
+                        "type": EventTypes.Member,
+                        "state_key": room_creator_user_id,
+                        "content": {"membership": Membership.JOIN},
+                        "auth_events": [room_create_event.event_id],
+                        "prev_events": [room_create_event.event_id],
+                    },
+                    room_version,
+                    known_room_creation_event_base=room_create_event,
+                )
             ),
             room_version=room_version,
         )
@@ -237,20 +248,24 @@ class OutOfBandMembershipTests(unittest.FederatingHomeserverTestCase):
         # From the remote homeserver, invite user1 on the local homserver
         user1_invite_membership_event = make_event_from_dict(
             self.add_hashes_and_signatures_from_other_server(
-                {
-                    "room_id": remote_room_id,
-                    "sender": room_creator_user_id,
-                    "depth": 3,
-                    "origin_server_ts": 3,
-                    "type": EventTypes.Member,
-                    "state_key": local_user1_id,
-                    "content": {"membership": Membership.INVITE},
-                    "auth_events": [
-                        room_create_event.event_id,
-                        creator_membership_event.event_id,
-                    ],
-                    "prev_events": [creator_membership_event.event_id],
-                }
+                forwards_compatibility_filter_out_event_keys_for_various_room_versions(
+                    {
+                        "room_id": remote_room_id,
+                        "sender": room_creator_user_id,
+                        "depth": 3,
+                        "origin_server_ts": 3,
+                        "type": EventTypes.Member,
+                        "state_key": local_user1_id,
+                        "content": {"membership": Membership.INVITE},
+                        "auth_events": [
+                            room_create_event.event_id,
+                            creator_membership_event.event_id,
+                        ],
+                        "prev_events": [creator_membership_event.event_id],
+                    },
+                    room_version,
+                    known_room_creation_event_base=room_create_event,
+                )
             ),
             room_version=room_version,
         )
@@ -298,20 +313,24 @@ class OutOfBandMembershipTests(unittest.FederatingHomeserverTestCase):
                 time.sleep(0.1)
 
         user1_join_membership_event_template = make_event_from_dict(
-            {
-                "room_id": remote_room_id,
-                "sender": local_user1_id,
-                "depth": 4,
-                "origin_server_ts": 4,
-                "type": EventTypes.Member,
-                "state_key": local_user1_id,
-                "content": {"membership": Membership.JOIN},
-                "auth_events": [
-                    room_create_event.event_id,
-                    user1_invite_membership_event.event_id,
-                ],
-                "prev_events": [user1_invite_membership_event.event_id],
-            },
+            forwards_compatibility_filter_out_event_keys_for_various_room_versions(
+                {
+                    "room_id": remote_room_id,
+                    "sender": local_user1_id,
+                    "depth": 4,
+                    "origin_server_ts": 4,
+                    "type": EventTypes.Member,
+                    "state_key": local_user1_id,
+                    "content": {"membership": Membership.JOIN},
+                    "auth_events": [
+                        room_create_event.event_id,
+                        user1_invite_membership_event.event_id,
+                    ],
+                    "prev_events": [user1_invite_membership_event.event_id],
+                },
+                room_version,
+                known_room_creation_event_base=room_create_event,
+            ),
             room_version=room_version,
         )
 
@@ -537,34 +556,43 @@ class OutOfBandMembershipTests(unittest.FederatingHomeserverTestCase):
 
         self.federation_http_client.put_json.side_effect = put_json
 
-        # From the remote homeserver, invite user2 on the local homserver
+        # From the remote homeserver, invite user2 on the local homeserver
         user2_invite_membership_event = make_event_from_dict(
             self.add_hashes_and_signatures_from_other_server(
-                {
-                    "room_id": remote_room_id,
-                    "sender": remote_room_join_result.remote_room_creator_user_id,
-                    "depth": 5,
-                    "origin_server_ts": 5,
-                    "type": EventTypes.Member,
-                    "state_key": local_user2_id,
-                    "content": {"membership": Membership.INVITE},
-                    "auth_events": [
-                        remote_room_join_result.state_map[
-                            (EventTypes.Create, "")
-                        ].event_id,
-                        remote_room_join_result.state_map[
-                            (
-                                EventTypes.Member,
-                                remote_room_join_result.remote_room_creator_user_id,
-                            )
-                        ].event_id,
+                forwards_compatibility_filter_out_event_keys_for_various_room_versions(
+                    {
+                        "room_id": remote_room_id,
+                        "sender": remote_room_join_result.remote_room_creator_user_id,
+                        "depth": 5,
+                        "origin_server_ts": 5,
+                        "type": EventTypes.Member,
+                        "state_key": local_user2_id,
+                        "content": {"membership": Membership.INVITE},
+                        "auth_events": [
+                            remote_room_join_result.state_map[
+                                (EventTypes.Create, "")
+                            ].event_id,
+                            remote_room_join_result.state_map[
+                                (
+                                    EventTypes.Member,
+                                    remote_room_join_result.remote_room_creator_user_id,
+                                )
+                            ].event_id,
+                        ],
+                        "prev_events": [
+                            remote_room_join_result.state_map[
+                                (
+                                    EventTypes.Member,
+                                    remote_room_join_result.local_user1_id,
+                                )
+                            ].event_id
+                        ],
+                    },
+                    room_version,
+                    known_room_creation_event_base=remote_room_join_result.state_map[
+                        (EventTypes.Create, "")
                     ],
-                    "prev_events": [
-                        remote_room_join_result.state_map[
-                            (EventTypes.Member, remote_room_join_result.local_user1_id)
-                        ].event_id
-                    ],
-                }
+                )
             ),
             room_version=room_version,
         )
