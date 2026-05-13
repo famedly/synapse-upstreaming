@@ -30,7 +30,7 @@ from synapse.server import HomeServer
 from synapse.storage.databases.main.room import _BackgroundUpdates
 from synapse.util.clock import Clock
 
-from tests.unittest import HomeserverTestCase
+from tests.unittest import HomeserverTestCase, override_config
 
 
 class RoomBackgroundUpdateStoreTestCase(HomeserverTestCase):
@@ -64,10 +64,14 @@ class RoomBackgroundUpdateStoreTestCase(HomeserverTestCase):
         # Now let's actually drive the updates to completion
         self.wait_for_background_updates()
 
+    @override_config({"default_room_version": "10"})
     def test_background_populate_rooms_creator_column(self) -> None:
         """Test that the background update to populate the rooms creator column
         works properly.
         """
+        # The code this test depends on fills in the room creator from the creation
+        # event "content" dictionary having a "creator" key. This format stopped in room
+        # version 11, so pin this test to version 10 as the last that it supports.
 
         # Insert a room without the creator
         room_id = self._generate_room()
