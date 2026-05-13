@@ -162,6 +162,8 @@ class _EventRow:
     Properties:
         event_id: The event ID of the event.
 
+        room_id: The room ID the event is part of.
+
         stream_ordering: stream ordering for this event
 
         json: json-encoded event structure
@@ -189,6 +191,7 @@ class _EventRow:
     """
 
     event_id: str
+    room_id: str
     stream_ordering: int
     instance_name: str
     json: str
@@ -1459,7 +1462,7 @@ class EventsWorkerStore(SQLBaseStore):
                 #
                 if d["type"] != EventTypes.Member:
                     raise InvalidEventError(
-                        "Room %s for event %s is unknown" % (d["room_id"], event_id)
+                        "Room %s for event %s is unknown" % (row.room_id, event_id)
                     )
 
                 # so, assuming this is an out-of-band-invite that arrived before
@@ -1490,7 +1493,7 @@ class EventsWorkerStore(SQLBaseStore):
                     logger.warning(
                         "Event %s in room %s has unknown room version %s",
                         event_id,
-                        d["room_id"],
+                        row.room_id,
                         room_version_id,
                     )
                     continue
@@ -1500,7 +1503,7 @@ class EventsWorkerStore(SQLBaseStore):
                         "Event %s in room %s with version %s has wrong format: "
                         "expected %s, was %s",
                         event_id,
-                        d["room_id"],
+                        row.room_id,
                         room_version_id,
                         room_version.event_format,
                         format_version,
@@ -1524,7 +1527,7 @@ class EventsWorkerStore(SQLBaseStore):
                 # it's difficult to see what to do here. Pretty much all bets are off
                 # if Synapse cannot rely on the consistency of its database.
                 raise DatabaseCorruptionError(
-                    d["room_id"], event_id, original_ev.event_id
+                    row.room_id, event_id, original_ev.event_id
                 )
 
             event_map[event_id] = original_ev
@@ -1595,11 +1598,12 @@ class EventsWorkerStore(SQLBaseStore):
         Returns:
             A map from event id to event info.
         """
-        event_dict = {}
+        event_dict: dict[str, _EventRow] = {}
         for evs in batch_iter(event_ids, 200):
             sql = """\
                 SELECT
                   e.event_id,
+                  e.room_id,
                   e.stream_ordering,
                   e.instance_name,
                   ej.internal_metadata,
@@ -1624,17 +1628,18 @@ class EventsWorkerStore(SQLBaseStore):
                 event_id = row[0]
                 event_dict[event_id] = _EventRow(
                     event_id=event_id,
-                    stream_ordering=row[1],
+                    room_id=row[1],
+                    stream_ordering=row[2],
                     # If instance_name is null we default to "master"
-                    instance_name=row[2] or "master",
-                    internal_metadata=row[3],
-                    json=row[4],
-                    format_version=row[5],
-                    room_version_id=row[6],
-                    rejected_reason=row[7],
+                    instance_name=row[3] or "master",
+                    internal_metadata=row[4],
+                    json=row[5],
+                    format_version=row[6],
+                    room_version_id=row[7],
+                    rejected_reason=row[8],
                     unconfirmed_redactions=[],
                     confirmed_redactions=[],
-                    outlier=bool(row[8]),  # This is an int in SQLite3
+                    outlier=bool(row[9]),  # This is an int in SQLite3
                 )
 
             # check for redactions
@@ -1662,7 +1667,7 @@ class EventsWorkerStore(SQLBaseStore):
                         continue
                     events.append(event)
                     event_json = json.loads(event.json)
-                    room_id = event_json.get("room_id")
+                    room_id = event.room_id
                     user_id = event_json.get("sender")
                     to_check.append((room_id, user_id))
                 except Exception as exc:
@@ -1687,7 +1692,7 @@ class EventsWorkerStore(SQLBaseStore):
             ) in txn:
                 for e_row in events:
                     e_json = json.loads(e_row.json)
-                    room_id = e_json.get("room_id")
+                    room_id = e_row.room_id
                     user_id = e_json.get("sender")
                     room_and_user = (returned_room_id, returned_user_id)
                     # check if we have a redaction match for this room, user combination
