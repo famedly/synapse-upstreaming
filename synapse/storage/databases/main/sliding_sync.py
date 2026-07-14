@@ -28,7 +28,7 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_in_list_sql_clause,
 )
-from synapse.storage.engines import Psycopg2Engine
+from synapse.storage.engines import PostgresEngine, Psycopg2Engine
 from synapse.types import MultiWriterStreamToken, RoomStreamToken
 from synapse.types.handlers.sliding_sync import (
     HaveSentRoom,
