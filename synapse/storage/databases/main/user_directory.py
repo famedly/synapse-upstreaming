@@ -743,6 +743,8 @@ class UserDirectoryBackgroundUpdateStore(StateDeltasStore):
             # time. However, `executemany()` on psycopg uses it's internal pipeline
             # mode to be much faster than an iterative `execute()`, especially on
             # writes.
+            # FIXME(psycopg): once a more performative method is established, switch
+            #  away from `executemany()` for this `UPSERT`.
             sql = """
                 INSERT INTO user_directory_search(user_id, vector)
                 VALUES
