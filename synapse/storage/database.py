@@ -1412,7 +1412,7 @@ class DatabasePool:
             )
             txn.copy_write(sql, (), values)
 
-        else:
+        elif isinstance(txn.database_engine, Sqlite3Engine):
             sql = "INSERT INTO %s (%s) VALUES(%s)" % (
                 table,
                 ", ".join(k for k in keys),
@@ -1420,6 +1420,10 @@ class DatabasePool:
             )
 
             txn.execute_batch(sql, values)
+
+        else:
+            # mypy does not like that self.database_engine is not a Never type
+            assert_never(txn.database_engine)  # type: ignore[arg-type]
 
     async def simple_upsert(
         self,
