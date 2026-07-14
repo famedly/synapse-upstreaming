@@ -498,7 +498,7 @@ class LoggingTransaction:
 
             # execute_values requires a single replacement, but we need to expand it
             # for COPY. These inner sequences must be the same length.
-            assertion_length = 0
+            assertion_length: int | None = None
             for _inner_value in values:
                 # Check for the Sized class here, to verify that this particular
                 # iterable can use len(). In the future, switch the `values` argument to
@@ -506,9 +506,14 @@ class LoggingTransaction:
                 # types wanted while excluding Generators and this assertion can be
                 # removed.
                 assert isinstance(_inner_value, Sized)
-                if not assertion_length:
+                if assertion_length is None:
                     assertion_length = len(_inner_value)
-                assert assertion_length == len(_inner_value)
+                assert assertion_length == len(_inner_value), (
+                    "Inner value passed that was not the same length as the first "
+                    "value. Please ensure each inner value passed to execute_values() "
+                    f"is the same length. Length: this value({len(_inner_value)}) first "
+                    f"value({assertion_length})"
+                )
 
             # To avoid having to port several psycopg2 utilities that are built into its
             # Cursor class(like `mogrify`, for example) in order to re-use `from
