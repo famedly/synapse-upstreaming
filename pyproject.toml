@@ -127,7 +127,7 @@ postgres = [
     "psycopg2cffi-compat==1.1;platform_python_implementation == 'PyPy'",
 ]
 # The "pure python" implementation of psycopg(v3+) does not play nicely with the
-# complement docker image because of differences in the required debian package `libpq`.
+# Complement Docker image because of differences in the required Debian package `libpq`.
 # Using the "binary" extra to inject that correct lib prevented the debian packaging of
 # Synapse to fail(see test workflow 'poetry_lockfile' where all packages must have
 # sdists and not just wheels). The "c" extra is a source distribution, but requires a
