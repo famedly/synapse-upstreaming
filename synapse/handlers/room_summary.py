@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Iterable, Optional, Sequence
 import attr
 
 from synapse.api.constants import (
+    EventContentFields,
     EventTypes,
     HistoryVisibility,
     JoinRules,
@@ -779,39 +780,87 @@ class RoomSummaryHandler:
         Returns:
             The JSON dictionary for the room.
         """
-        stats = await self._store.get_room_with_stats(room_id)
+        joined_members = await self._store.get_number_joined_users_in_room(room_id)
+        state_filter = StateFilter.from_types(
+            (
+                (EventTypes.Create, ""),
+                (EventTypes.Name, ""),
+                (EventTypes.Topic, ""),
+                (EventTypes.CanonicalAlias, ""),
+                (EventTypes.RoomAvatar, ""),
+                (EventTypes.JoinRules, ""),
+                (EventTypes.RoomHistoryVisibility, ""),
+                (EventTypes.GuestAccess, ""),
+                (EventTypes.RoomEncryption, ""),
+            )
+        )
+        state_map = await self._storage_controllers.state.get_current_state(
+            room_id,
+            state_filter=state_filter,
+        )
 
-        # currently this should be impossible because we call
-        # _is_local_room_accessible on the room before we get here, so
-        # there should always be an entry
-        assert stats is not None, "unable to retrieve stats for %s" % (room_id,)
-
+        # Prepare the entry block. According to the spec, an `m.room.guest_access`
+        # event that is missing is to be treated as `"forbidden"` and an
+        # `m.room.history_visibility` event that is missing is to be treated as
+        # `"shared"`. That means both of these are `False` by default. There is no state
+        # that was retrieved to populate `num_Joined_members` so go ahead and do that
+        # now.
         entry: JsonDict = {
-            "room_id": stats.room_id,
-            "room_version": stats.version,
-            "name": stats.name,
-            "topic": stats.topic,
-            "canonical_alias": stats.canonical_alias,
-            "num_joined_members": stats.joined_members,
-            "avatar_url": stats.avatar,
-            "join_rule": stats.join_rules,
-            "world_readable": (
-                stats.history_visibility == HistoryVisibility.WORLD_READABLE
-            ),
-            "guest_can_join": stats.guest_access == "can_join",
-            "room_type": stats.room_type,
-            "encryption": stats.encryption,
+            "guest_can_join": False,
+            "world_readable": False,
+            "num_joined_members": joined_members,
         }
 
-        # Include allowed_room_ids for rooms with restricted join rules so that
+        for state_key, state_event in state_map.items():
+            match state_key:
+                case (EventTypes.Create, ""):
+                    entry["room_id"] = state_event.room_id
+                    entry["room_version"] = state_event.content.get(
+                        EventContentFields.ROOM_VERSION
+                    )
+                    entry["room_type"] = state_event.content.get(
+                        EventContentFields.ROOM_TYPE
+                    )
+                case (EventTypes.Name, ""):
+                    entry["name"] = state_event.content.get(
+                        EventContentFields.ROOM_NAME
+                    )
+                case (EventTypes.Topic, ""):
+                    # Specifically, this should be the plain text version "topic" and
+                    # not "m.topic" which has mimetypes to sort through
+                    entry["topic"] = state_event.content.get(EventContentFields.TOPIC)
+                case (EventTypes.CanonicalAlias, ""):
+                    entry["canonical_alias"] = state_event.content.get("alias")
+                case (EventTypes.RoomAvatar, ""):
+                    entry["avatar_url"] = state_event.content.get("url")
+                case (EventTypes.JoinRules, ""):
+                    entry["join_rule"] = state_event.content.get("join_rule")
+                case (EventTypes.RoomHistoryVisibility, ""):
+                    entry["world_readable"] = (
+                        state_event.content.get("history_visibility")
+                        == HistoryVisibility.WORLD_READABLE
+                    )
+                case (EventTypes.GuestAccess, ""):
+                    entry["guest_can_join"] = (
+                        state_event.content.get(EventContentFields.GUEST_ACCESS)
+                        == "can_join"
+                    )
+                case (EventTypes.RoomEncryption, ""):
+                    entry["encryption"] = state_event.content.get(
+                        EventContentFields.ENCRYPTION_ALGORITHM
+                    )
+
+        # Include `allowed_room_ids` for rooms with restricted join rules so that
         # clients can determine which memberships grant access.
-        # Only the join rules event is needed for both has_restricted_join_rules
-        # and get_rooms_that_allow_join, so avoid fetching full state.
-        join_rules_state_ids = (
-            await self._storage_controllers.state.get_current_state_ids(
-                room_id,
-                state_filter=StateFilter.from_types([(EventTypes.JoinRules, "")]),
-            )
+        # Only the join rules event is needed for both `has_restricted_join_rules()`
+        # and `get_rooms_that_allow_join()`, so pull the state id out of the retrieved
+        # `state_map` above. This should be a fairly cheap call below, since this event
+        # will already be cached.
+        join_rule_event = state_map.get((EventTypes.JoinRules, ""))
+        join_rules_state_ids: dict[tuple[str, str], str] = (
+            {(EventTypes.JoinRules, ""): join_rule_event.event_id}
+            if join_rule_event
+            else {}
         )
 
         try:
@@ -828,10 +877,8 @@ class RoomSummaryHandler:
             if allowed_rooms:
                 entry["allowed_room_ids"] = allowed_rooms
 
-        # Filter out Nones – rather omit the field altogether
-        room_entry = {k: v for k, v in entry.items() if v is not None}
-
-        return room_entry
+        # The opportunistic parsing above ensured there were no `None`'s in the entry
+        return entry
 
     async def _get_child_events(self, room_id: str) -> Iterable[EventBase]:
         """
