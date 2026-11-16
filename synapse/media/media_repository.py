@@ -19,6 +19,7 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+import contextlib
 import errno
 import logging
 import os
@@ -61,6 +62,7 @@ from synapse.media._base import (
 )
 from synapse.media.filepath import MediaFilePaths
 from synapse.media.media_storage import (
+    SHA256_FILES_LOCK_NAME,
     MediaStorage,
     SHA256TransparentIOWriter,
 )
@@ -82,6 +84,7 @@ from synapse.util.retryutils import NotRetryingDestination
 from synapse.util.stringutils import random_string
 
 if TYPE_CHECKING:
+    from synapse.handlers.worker_lock import WaitingLock
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
@@ -92,6 +95,7 @@ UPDATE_RECENTLY_ACCESSED_TS = Duration(minutes=1)
 # How often to run the background job to check for local and remote media
 # that should be purged according to the configured media retention settings.
 MEDIA_RETENTION_CHECK_PERIOD = Duration(hours=1)
+MEDIA_TEMP_FILE_CLEANUP_PERIOD = Duration(hours=1)
 
 
 class MediaRepository:
@@ -130,6 +134,8 @@ class MediaRepository:
             clock=hs.get_clock(),
             cfg=hs.config.ratelimiting.remote_media_downloads,
         )
+
+        self._worker_locks = hs.get_worker_locks_handler()
 
         # List of StorageProviders where we should search for media and
         # potentially upload to.
@@ -206,6 +212,12 @@ class MediaRepository:
 
         self.media_repository_callbacks = hs.get_module_api_callbacks().media_repository
 
+        if hs.config.worker.run_background_tasks:
+            self.clock.looping_call(
+                self._start_cleanup_stale_media_temporary_files,
+                MEDIA_TEMP_FILE_CLEANUP_PERIOD,
+            )
+
     def _start_update_recently_accessed(self) -> Deferred:
         return self.hs.run_as_background_process(
             "update_recently_accessed_media",
@@ -216,6 +228,12 @@ class MediaRepository:
         return self.hs.run_as_background_process(
             "apply_media_retention_rules",
             self._apply_media_retention_rules,
+        )
+
+    def _start_cleanup_stale_media_temporary_files(self) -> Deferred:
+        return self.hs.run_as_background_process(
+            "cleanup_stale_media_temporary_files",
+            self.media_storage.cleanup_stale_temporary_files,
         )
 
     async def _update_recently_accessed(self) -> None:
@@ -315,6 +333,11 @@ class MediaRepository:
         if media.created_ts < expired_time_ms:
             raise NotFoundError("Media ID has expired")
 
+    def _lock_sha256_files(self, server_name: str | None, sha256: str) -> "WaitingLock":
+        return self._worker_locks.acquire_lock(
+            SHA256_FILES_LOCK_NAME, f"{server_name or ''}/{sha256}"
+        )
+
     @trace
     async def create_or_update_content(
         self,
@@ -350,47 +373,57 @@ class MediaRepository:
         await self._check_media_upload_limits(auth_user, content_length)
         file_info = FileInfo(server_name=None, file_id=media_id)
 
-        async with self.media_storage.store_into_file(file_info) as (f, fname):
-            sha256writer = SHA256TransparentIOWriter(f)
-            await self.media_storage.write_to_file(content, sha256writer.wrap())
+        async with contextlib.AsyncExitStack() as sha256_lock:
+            async with self.media_storage.store_into_file(file_info) as (f, fname):
+                # For new media `f` already hashes what is written, so reuse it.
+                sha256writer = SHA256TransparentIOWriter.get_or_wrap(f)
+                await self.media_storage.write_to_file(content, sha256writer.wrap())
+                sha256 = sha256writer.hexdigest()
 
-        logger.info("Stored local media in file %r", fname)
-        sha256 = sha256writer.hexdigest()
+                # Acquire before the block exits, as the exit renames the temporary
+                # file onto the SHA-256 path.
+                await sha256_lock.enter_async_context(
+                    self._lock_sha256_files(None, sha256)
+                )
 
-        # Media matching the hash of already-quarantined media is quarantined
-        # on upload.
-        quarantined_by: str | None = None
-        if await self.store.get_is_hash_quarantined(sha256):
-            logger.warning(
-                "Media has been automatically quarantined as it matched existing quarantined media"
-            )
-            quarantined_by = "system"
+            logger.info("Stored local media in file %r", fname)
 
-        if is_new_media:
-            await self.store.store_local_media(
-                media_id=media_id,
-                media_type=media_type,
-                time_now_ms=self.clock.time_msec(),
-                upload_name=upload_name,
-                media_length=content_length,
-                user_id=auth_user,
-                sha256=sha256,
-                quarantined_by=quarantined_by,
-            )
-        else:
-            # The row was already created by `create_media_id` (async upload).
-            await self.store.update_local_media(
-                media_id=media_id,
-                media_type=media_type,
-                upload_name=upload_name,
-                media_length=content_length,
-                user_id=auth_user,
-                sha256=sha256,
-                quarantined_by=quarantined_by,
-            )
+            # Media matching the hash of already-quarantined media is quarantined
+            # on upload.
+            quarantined_by: str | None = None
+            if await self.store.get_is_hash_quarantined(sha256):
+                logger.warning(
+                    "Media has been automatically quarantined as it matched existing quarantined media"
+                )
+                quarantined_by = "system"
+
+            if is_new_media:
+                await self.store.store_local_media(
+                    media_id=media_id,
+                    media_type=media_type,
+                    time_now_ms=self.clock.time_msec(),
+                    upload_name=upload_name,
+                    media_length=content_length,
+                    user_id=auth_user,
+                    sha256=sha256,
+                    quarantined_by=quarantined_by,
+                )
+            else:
+                # The row was already created by `create_media_id` (async upload).
+                await self.store.update_local_media(
+                    media_id=media_id,
+                    media_type=media_type,
+                    upload_name=upload_name,
+                    media_length=content_length,
+                    user_id=auth_user,
+                    sha256=sha256,
+                    quarantined_by=quarantined_by,
+                )
 
         try:
-            await self._generate_thumbnails(None, media_id, media_id, media_type)
+            await self._generate_thumbnails(
+                None, media_id, media_id, media_type, origin_sha256=sha256
+            )
         except Exception as e:
             logger.info("Failed to generate thumbnails: %s", e)
 
@@ -600,7 +633,9 @@ class MediaRepository:
         upload_name = name if name else media_info.upload_name
         url_cache = media_info.url_cache
 
-        file_info = FileInfo(None, media_id, url_cache=bool(url_cache))
+        file_info = FileInfo(
+            None, media_id, url_cache=bool(url_cache), sha256=media_info.sha256
+        )
 
         responder = await self.media_storage.fetch_media(file_info)
         if federation:
@@ -796,7 +831,7 @@ class MediaRepository:
         # If we have an entry in the DB, try and look for it
         if media_info:
             file_id = media_info.filesystem_id
-            file_info = FileInfo(server_name, file_id)
+            file_info = FileInfo(server_name, file_id, sha256=media_info.sha256)
 
             if media_info.quarantined_by and not bypass_quarantine:
                 logger.info("Media is quarantined")
@@ -851,7 +886,7 @@ class MediaRepository:
         file_id = media_info.filesystem_id
         if not media_info.media_type:
             media_info = attr.evolve(media_info, media_type="application/octet-stream")
-        file_info = FileInfo(server_name, file_id)
+        file_info = FileInfo(server_name, file_id, sha256=media_info.sha256)
 
         # We generate thumbnails even if another process downloaded the media
         # as a) it's conceivable that the other download request dies before it
@@ -860,44 +895,15 @@ class MediaRepository:
         # otherwise they'll request thumbnails and get a 404 if they're not
         # ready yet.
         await self._generate_thumbnails(
-            server_name, media_id, file_id, media_info.media_type
+            server_name,
+            media_id,
+            file_id,
+            media_info.media_type,
+            origin_sha256=media_info.sha256,
         )
 
         responder = await self.media_storage.fetch_media(file_info)
         return responder, media_info
-
-    async def _store_remote_media_with_cleanup(
-        self,
-        server_name: str,
-        media_id: str,
-        media_type: str,
-        time_now_ms: int,
-        upload_name: str | None,
-        media_length: int,
-        filesystem_id: str,
-        sha256: str,
-        fname: str,
-    ) -> None:
-        """Store remote media in database and clean up file on constraint violation."""
-        try:
-            await self.store.store_cached_remote_media(
-                origin=server_name,
-                media_id=media_id,
-                media_type=media_type,
-                time_now_ms=time_now_ms,
-                upload_name=upload_name,
-                media_length=media_length,
-                filesystem_id=filesystem_id,
-                sha256=sha256,
-            )
-        except self.store.database_engine.module.IntegrityError:
-            # Another worker downloaded the media first. Clean up our file.
-            try:
-                os.remove(fname)
-            except Exception:
-                pass
-            # Re-raise so the caller can handle it
-            raise
 
     async def _download_remote_file(
         self,
@@ -987,81 +993,93 @@ class MediaRepository:
             if use_federation_endpoint
             else self.client.download_media
         )
+        # The stack keeps the SHA-256 lock held after `store_into_file` exits,
+        # until the DB row below is inserted.
+        async with contextlib.AsyncExitStack() as sha256_lock:
+            async with self.media_storage.store_into_file(file_info) as (f, fname):
+                # For new media `f` already hashes what is written, so reuse it.
+                sha256writer = SHA256TransparentIOWriter.get_or_wrap(f)
+                try:
+                    res = await download(
+                        server_name,
+                        media_id,
+                        # This implements all of BinaryIO as it has a passthrough
+                        output_stream=sha256writer.wrap(),
+                        max_size=self.max_upload_size,
+                        max_timeout_ms=max_timeout_ms,
+                        download_ratelimiter=download_ratelimiter,
+                        ip_address=ip_address,
+                    )
+                    # The federation endpoint additionally returns the multipart JSON
+                    # metadata, which we don't use. Only keep (length, headers).
+                    length, headers = res[0], res[1]
+                except RequestSendFailed as e:
+                    logger.warning(
+                        "Request failed fetching remote media %s/%s: %r",
+                        server_name,
+                        media_id,
+                        e,
+                    )
+                    raise SynapseError(502, "Failed to fetch remote media")
 
-        async with self.media_storage.store_into_file(file_info) as (f, fname):
-            sha256writer = SHA256TransparentIOWriter(f)
+                except HttpResponseException as e:
+                    logger.warning(
+                        "HTTP error fetching remote media %s/%s: %s",
+                        server_name,
+                        media_id,
+                        e.response,
+                    )
+                    if e.code == twisted.web.http.NOT_FOUND:
+                        raise e.to_synapse_error()
+                    raise SynapseError(502, "Failed to fetch remote media")
+
+                except SynapseError:
+                    logger.warning(
+                        "Failed to fetch remote media %s/%s", server_name, media_id
+                    )
+                    raise
+                except NotRetryingDestination:
+                    logger.warning("Not retrying destination %r", server_name)
+                    raise SynapseError(502, "Failed to fetch remote media")
+                except Exception:
+                    logger.exception(
+                        "Failed to fetch remote media %s/%s", server_name, media_id
+                    )
+                    raise SynapseError(502, "Failed to fetch remote media")
+
+                if b"Content-Type" in headers:
+                    media_type = headers[b"Content-Type"][0].decode("ascii")
+                else:
+                    media_type = "application/octet-stream"
+                upload_name = get_filename_from_headers(headers)
+                time_now_ms = self.clock.time_msec()
+                sha256 = sha256writer.hexdigest()
+
+                # Acquire before the block exits, as the exit renames the temporary
+                # file onto the SHA-256 path.
+                await sha256_lock.enter_async_context(
+                    self._lock_sha256_files(server_name, sha256)
+                )
+
             try:
-                res = await download(
-                    server_name,
-                    media_id,
-                    # This implements all of BinaryIO as it has a passthrough
-                    output_stream=sha256writer.wrap(),
-                    max_size=self.max_upload_size,
-                    max_timeout_ms=max_timeout_ms,
-                    download_ratelimiter=download_ratelimiter,
-                    ip_address=ip_address,
+                await self.store.store_cached_remote_media(
+                    origin=server_name,
+                    media_id=media_id,
+                    media_type=media_type,
+                    time_now_ms=time_now_ms,
+                    upload_name=upload_name,
+                    media_length=length,
+                    filesystem_id=file_id,
+                    sha256=sha256,
                 )
-                # The federation endpoint additionally returns the multipart JSON
-                # metadata, which we don't use. Only keep (length, headers).
-                length, headers = res[0], res[1]
-            except RequestSendFailed as e:
-                logger.warning(
-                    "Request failed fetching remote media %s/%s: %r",
-                    server_name,
-                    media_id,
-                    e,
-                )
-                raise SynapseError(502, "Failed to fetch remote media")
-
-            except HttpResponseException as e:
-                logger.warning(
-                    "HTTP error fetching remote media %s/%s: %s",
-                    server_name,
-                    media_id,
-                    e.response,
-                )
-                if e.code == twisted.web.http.NOT_FOUND:
-                    raise e.to_synapse_error()
-                raise SynapseError(502, "Failed to fetch remote media")
-
-            except SynapseError:
-                logger.warning(
-                    "Failed to fetch remote media %s/%s", server_name, media_id
-                )
+            except self.store.database_engine.module.IntegrityError:
+                # Multiple remote media download requests can race (when using
+                # multiple media repos), and another worker recorded this media
+                # first. If this download created the SHA-256 file and no row
+                # references it, remove it. This runs under the lock, so no new
+                # row can appear between the check and the removal.
+                await self._remove_sha256_files_if_unused(server_name, sha256)
                 raise
-            except NotRetryingDestination:
-                logger.warning("Not retrying destination %r", server_name)
-                raise SynapseError(502, "Failed to fetch remote media")
-            except Exception:
-                logger.exception(
-                    "Failed to fetch remote media %s/%s", server_name, media_id
-                )
-                raise SynapseError(502, "Failed to fetch remote media")
-
-            if b"Content-Type" in headers:
-                media_type = headers[b"Content-Type"][0].decode("ascii")
-            else:
-                media_type = "application/octet-stream"
-            upload_name = get_filename_from_headers(headers)
-            time_now_ms = self.clock.time_msec()
-
-        sha256 = sha256writer.hexdigest()
-
-        # Multiple remote media download requests can race (when using
-        # multiple media repos), so this may throw a violation constraint
-        # exception. If it does we'll delete the newly downloaded file from
-        # disk.
-        await self._store_remote_media_with_cleanup(
-            server_name=server_name,
-            media_id=media_id,
-            media_type=media_type,
-            time_now_ms=time_now_ms,
-            upload_name=upload_name,
-            media_length=length,
-            filesystem_id=file_id,
-            sha256=sha256,
-            fname=fname,
-        )
 
         logger.info("Stored remote media in file %r", fname)
 
@@ -1161,6 +1179,7 @@ class MediaRepository:
         t_type: str,
         url_cache: bool,
         animated: bool = False,
+        sha256: str | None = None,
     ) -> tuple[str, FileInfo] | None:
         """Generate and store a single thumbnail of local media.
 
@@ -1179,6 +1198,7 @@ class MediaRepository:
             t_type=t_type,
             url_cache=url_cache,
             animated=animated,
+            sha256=sha256,
         )
 
     async def generate_remote_exact_thumbnail(
@@ -1191,6 +1211,7 @@ class MediaRepository:
         t_method: str,
         t_type: str,
         animated: bool = False,
+        sha256: str | None = None,
     ) -> str | None:
         """Generate and store a single thumbnail of cached remote media.
 
@@ -1208,6 +1229,7 @@ class MediaRepository:
             t_type=t_type,
             url_cache=False,
             animated=animated,
+            sha256=sha256,
         )
         return result[0] if result else None
 
@@ -1222,6 +1244,7 @@ class MediaRepository:
         t_type: str,
         url_cache: bool,
         animated: bool,
+        sha256: str | None,
     ) -> tuple[str, FileInfo] | None:
         """Generate a single thumbnail of the requested size and store it to the
         media store and database.
@@ -1242,7 +1265,7 @@ class MediaRepository:
             thumbnail could not be generated.
         """
         async with self.media_storage.ensure_media_is_in_local_cache(
-            FileInfo(server_name, file_id, url_cache=url_cache)
+            FileInfo(server_name, file_id, url_cache=url_cache, sha256=sha256)
         ) as input_path:
             try:
                 thumbnailer = Thumbnailer(input_path)
@@ -1283,6 +1306,7 @@ class MediaRepository:
             t_method,
             t_type,
             t_byte_source,
+            sha256,
         )
         logger.info("Stored thumbnail in file %r", output_path)
         return output_path, file_info
@@ -1295,6 +1319,7 @@ class MediaRepository:
         file_id: str,
         media_type: str,
         url_cache: bool = False,
+        origin_sha256: str | None = None,
     ) -> dict | None:
         """Generate and store thumbnails for an image.
 
@@ -1306,6 +1331,7 @@ class MediaRepository:
             media_type: The content type of the file
             url_cache: If we are thumbnailing images downloaded for the URL cache,
                 used exclusively by the url previewer
+            sha256: SHA-256 of the original media
 
         Returns:
             Dict with "width" and "height" keys of original image or None if the
@@ -1315,8 +1341,20 @@ class MediaRepository:
         if not requirements:
             return None
 
+        if (
+            origin_sha256
+            and not url_cache
+            and await self.store.copy_thumbnails_with_sha256(
+                origin_sha256, media_id, file_id, server_name
+            )
+        ):
+            logger.debug(
+                "Copied thumbnails of media %s from SHA-256 %s", media_id, origin_sha256
+            )
+            return None
+
         async with self.media_storage.ensure_media_is_in_local_cache(
-            FileInfo(server_name, file_id, url_cache=url_cache)
+            FileInfo(server_name, file_id, url_cache=url_cache, sha256=origin_sha256)
         ) as input_path:
             try:
                 thumbnailer = Thumbnailer(input_path)
@@ -1407,6 +1445,7 @@ class MediaRepository:
                                 t_method,
                                 v_type,
                                 t_byte_source,
+                                origin_sha256,
                             )
 
         return {"width": m_width, "height": m_height}
@@ -1422,6 +1461,7 @@ class MediaRepository:
         t_method: str,
         t_type: str,
         t_byte_source: BytesIO,
+        sha256: str | None,
     ) -> tuple[str, FileInfo]:
         """Store a generated thumbnail to the configured storage and database.
 
@@ -1440,6 +1480,7 @@ class MediaRepository:
                 type=t_type,
                 length=t_byte_source.getbuffer().nbytes,
             ),
+            sha256=sha256,
         )
 
         async with self.media_storage.store_into_file(file_info) as (f, fname):
@@ -1493,7 +1534,12 @@ class MediaRepository:
                 await self.store.store_local_thumbnail(
                     media_id, t_width, t_height, t_type, t_method, t_len
                 )
-        return fname, file_info
+
+        # `fname` may be a temporary file that was moved onto the SHA-256 path when
+        # the block exited, so return the path the thumbnail is kept at. Without a
+        # local store, `fname` is a temporary file that has already been removed.
+        kept_path = self.media_storage.local_filepath(file_info) or fname
+        return kept_path, file_info
 
     async def _apply_media_retention_rules(self) -> None:
         """
@@ -1560,13 +1606,16 @@ class MediaRepository:
             # TODO: Should we delete from the backup store
 
             async with self.remote_media_linearizer.queue(key):
-                if not self._remove_media_files_from_disk(
-                    self.filepaths.remote_media_filepath(origin, file_id),
-                    self.filepaths.remote_media_thumbnail_dir(origin, file_id),
-                ):
+                media_info = await self.store.get_cached_remote_media(origin, media_id)
+                removed = await self._remove_media_files_from_disk(origin, file_id)
+                if not removed:
                     continue
 
                 await self.store.delete_remote_media(origin, media_id)
+
+                if media_info and media_info.sha256:
+                    await self._release_sha256(origin, media_info.sha256)
+
                 deleted += 1
 
         return {"deleted": deleted}
@@ -1632,10 +1681,9 @@ class MediaRepository:
         removed_media = []
         for media_id in media_ids:
             logger.info("Deleting media with ID '%s'", media_id)
-            if not self._remove_media_files_from_disk(
-                self.filepaths.local_media_filepath(media_id),
-                self.filepaths.local_media_thumbnail_dir(media_id),
-            ):
+            media_info = await self.store.get_local_media(media_id)
+            removed = await self._remove_media_files_from_disk(None, media_id)
+            if not removed:
                 continue
 
             await self.store.delete_remote_media(self.server_name, media_id)
@@ -1643,33 +1691,64 @@ class MediaRepository:
             await self.store.delete_url_cache((media_id,))
             await self.store.delete_url_cache_media((media_id,))
 
+            if media_info and media_info.sha256 and not media_info.url_cache:
+                await self._release_sha256(None, media_info.sha256)
+
             removed_media.append(media_id)
 
         return removed_media, len(removed_media)
 
-    def _remove_media_files_from_disk(
-        self, media_path: str, thumbnail_dir: str
+    async def _release_sha256(self, server_name: str | None, sha256: str) -> None:
+        async with self._lock_sha256_files(server_name, sha256):
+            await self._remove_sha256_files_if_unused(server_name, sha256)
+
+    async def _remove_sha256_files_if_unused(
+        self, server_name: str | None, sha256: str
+    ) -> None:
+        if await self.store.is_media_sha256_in_use(sha256, server_name):
+            logger.debug("SHA-256 %r is in use", sha256)
+            return
+        await self._remove_media_files_from_disk(server_name, sha256)
+
+    async def _remove_media_files_from_disk(
+        self, server_name: str | None, identifier: str
     ) -> bool:
         """Remove a media file and its thumbnail directory from the local media store.
 
-        Only the primary local media store is touched: copies held by storage
-        providers are intentionally left in place, as they cannot be removed.
+        Only the local media store is touched. Copies held by storage providers are
+        left in place, as they cannot be removed.
 
         Args:
-            media_path: Path of the media file.
-            thumbnail_dir: Path of the directory holding the media's thumbnails.
+            server_name: The origin of remote media, or None for local media.
+            identifier: The media ID or filesystem ID, or the SHA-256, that the
+                paths are built from.
 
         Returns:
-            True if the media is gone from disk (including if the file was already
-            missing), False if the file could not be removed. On False the caller
-            must keep the media's database rows so the deletion can be retried.
+            True if the media file is gone from disk (including if it was already
+            missing), False if it could not be removed. On False the caller must
+            keep the media's database rows so the deletion can be retried.
         """
-        try:
-            os.remove(media_path)
-        except OSError as e:
-            logger.warning("Failed to remove file: %r: %s", media_path, e)
-            if e.errno != errno.ENOENT:
-                return False
+        media_path = self.media_storage.media_filepath(server_name, identifier)
+        remove_error = await defer_to_thread(
+            self.hs.get_reactor(), _remove_file, media_path
+        )
+        # A missing file counts as removed.
+        if remove_error is not None and remove_error.errno != errno.ENOENT:
+            logger.warning("Failed to remove file: %r: %s", media_path, remove_error)
+            return False
 
-        shutil.rmtree(thumbnail_dir, ignore_errors=True)
+        await defer_to_thread(
+            self.hs.get_reactor(),
+            shutil.rmtree,
+            self.media_storage.thumbnail_dirpath(server_name, identifier),
+            ignore_errors=True,
+        )
         return True
+
+
+def _remove_file(path: str) -> OSError | None:
+    try:
+        os.remove(path)
+    except OSError as e:
+        return e
+    return None
