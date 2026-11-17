@@ -1073,11 +1073,17 @@ class MediaRepository:
                     sha256=sha256,
                 )
             except self.store.database_engine.module.IntegrityError:
-                # Multiple remote media download requests can race (when using
-                # multiple media repos), and another worker recorded this media
-                # first. If this download created the SHA-256 file and no row
-                # references it, remove it. This runs under the lock, so no new
-                # row can appear between the check and the removal.
+                # The media is already recorded: either multiple remote media
+                # download requests raced (when using multiple media repos), or
+                # the file of media stored before SHA-256s were recorded was
+                # missing and has been downloaded again. In the latter case,
+                # record the SHA-256 so the row references the downloaded file.
+                await self.store.set_cached_remote_media_sha256_if_missing(
+                    server_name, media_id, sha256
+                )
+                # If this download created the SHA-256 file and no row references
+                # it, remove it. This runs under the lock, so no new row can
+                # appear between the check and the removal.
                 await self._remove_sha256_files_if_unused(server_name, sha256)
                 raise
 

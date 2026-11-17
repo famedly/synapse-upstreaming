@@ -748,6 +748,30 @@ class MediaRepositoryStore(MediaRepositoryBackgroundUpdateStore):
             desc="store_cached_remote_media",
         )
 
+    async def set_cached_remote_media_sha256_if_missing(
+        self, origin: str, media_id: str, sha256: str
+    ) -> bool:
+        """Record the SHA-256 of remote media stored before SHA-256s were recorded.
+        A SHA-256 that is already recorded is not changed.
+
+        Returns:
+            True if the SHA-256 was recorded.
+        """
+
+        def _txn(txn: LoggingTransaction) -> bool:
+            txn.execute(
+                """
+                UPDATE remote_media_cache SET sha256 = ?
+                WHERE media_origin = ? AND media_id = ? AND sha256 IS NULL
+                """,
+                (sha256, origin, media_id),
+            )
+            return txn.rowcount > 0
+
+        return await self.db_pool.runInteraction(
+            "set_cached_remote_media_sha256_if_missing", _txn
+        )
+
     async def update_cached_last_access_time(
         self,
         local_media: Iterable[str],
