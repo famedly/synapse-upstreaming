@@ -1337,7 +1337,7 @@ class MediaRepository:
             media_type: The content type of the file
             url_cache: If we are thumbnailing images downloaded for the URL cache,
                 used exclusively by the url previewer
-            sha256: SHA-256 of the original media
+            origin_sha256: SHA-256 of the original media
 
         Returns:
             Dict with "width" and "height" keys of original image or None if the

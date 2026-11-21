@@ -26,7 +26,6 @@ import logging
 import os
 import shutil
 import tempfile
-from collections.abc import AsyncGenerator
 from contextlib import closing
 from io import BytesIO
 from types import TracebackType
@@ -34,6 +33,7 @@ from typing import (
     IO,
     TYPE_CHECKING,
     Any,
+    AsyncIterator,
     BinaryIO,
     Callable,
     Sequence,
@@ -163,7 +163,7 @@ class MediaStorage:
     @contextlib.asynccontextmanager
     async def store_into_file(
         self, file_info: FileInfo
-    ) -> AsyncGenerator[tuple[BinaryIO, str], None]:
+    ) -> AsyncIterator[tuple[BinaryIO, str], None]:
         """Async Context manager used to get a file like object to write into, as
         described by file_info.
 
@@ -356,7 +356,7 @@ class MediaStorage:
     @contextlib.asynccontextmanager
     async def ensure_media_is_in_local_cache(
         self, file_info: FileInfo
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncIterator[str, None]:
         """Async context manager that ensures the given file is in the local cache.
         Attempts to download it from storage providers if it isn't.
 
