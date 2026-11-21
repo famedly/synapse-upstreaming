@@ -35,7 +35,7 @@ from synapse.server import HomeServer
 from synapse.util.clock import Clock
 
 from tests import unittest
-from tests.test_utils import SMALL_CMYK_JPEG, SMALL_PNG
+from tests.test_utils import SMALL_CMYK_JPEG, SMALL_PNG, SMALL_PNG_SHA256
 from tests.unittest import override_config
 
 VALID_TIMESTAMP = 1609459200000  # 2021-01-01 in milliseconds
@@ -85,7 +85,7 @@ class QueryMediaByIDTestCase(_AdminMediaTests):
                 time_now_ms=self.clock.time_msec(),
                 upload_name="test.png",
                 filesystem_id=file_id,
-                sha256=file_id,
+                sha256=SMALL_PNG_SHA256,
             )
         )
 
@@ -322,7 +322,7 @@ class DeleteMediaByIDTestCase(_AdminMediaTests):
         )
 
         # Test if the file exists
-        local_path = self.filepaths.local_media_filepath(media_id)
+        local_path = self.filepaths.local_media_filepath(SMALL_PNG_SHA256)
         self.assertTrue(os.path.exists(local_path))
 
         url = "/_synapse/admin/v1/media/%s/%s" % (self.server_name, media_id)
@@ -512,8 +512,7 @@ class DeleteMediaByDateSizeTestCase(_AdminMediaTests):
         self.pump(1.0)
 
         # test that the file exists
-        media_id = server_and_media_id.split("/")[1]
-        local_path = self.filepaths.local_media_filepath(media_id)
+        local_path = self.filepaths.local_media_filepath(SMALL_PNG_SHA256)
         self.assertTrue(os.path.exists(local_path))
 
         # timestamp after upload/create
@@ -526,7 +525,7 @@ class DeleteMediaByDateSizeTestCase(_AdminMediaTests):
         self.assertEqual(200, channel.code, msg=channel.json_body)
         self.assertEqual(1, channel.json_body["total"])
         self.assertEqual(
-            media_id,
+            server_and_media_id.split("/")[1],
             channel.json_body["deleted_media"][0],
         )
 
@@ -722,8 +721,7 @@ class DeleteMediaByDateSizeTestCase(_AdminMediaTests):
         """
         Try to access a media and check the result
         """
-        media_id = server_and_media_id.split("/")[1]
-        local_path = self.filepaths.local_media_filepath(media_id)
+        local_path = self.filepaths.local_media_filepath(SMALL_PNG_SHA256)
 
         channel = self.make_request(
             "GET",

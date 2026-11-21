@@ -79,7 +79,7 @@ from tests.media.test_media_storage import (
     small_png_with_transparency,
 )
 from tests.server import FakeChannel, FakeTransport, ThreadedMemoryReactorClock
-from tests.test_utils import SMALL_PNG, list_stored_media_files
+from tests.test_utils import SMALL_PNG, SMALL_PNG_SHA256, list_stored_media_files
 from tests.unittest import override_config
 
 try:
@@ -145,7 +145,7 @@ class MediaDomainBlockingTests(unittest.HomeserverTestCase):
                 time_now_ms=clock.time_msec(),
                 upload_name="test.png",
                 filesystem_id=file_id,
-                sha256=file_id,
+                sha256=SMALL_PNG_SHA256,
             )
         )
         self.register_user("user", "password")
@@ -2754,7 +2754,7 @@ class AuthenticatedMediaTestCase(unittest.HomeserverTestCase):
                 time_now_ms=self.clock.time_msec(),
                 upload_name="remote_test.png",
                 filesystem_id=file_id,
-                sha256=file_id,
+                sha256=SMALL_PNG_SHA256,
             )
         )
 
@@ -2762,7 +2762,11 @@ class AuthenticatedMediaTestCase(unittest.HomeserverTestCase):
         if self.extra_config == {"dynamic_thumbnails": False}:
             self.get_success(
                 self.repo._generate_thumbnails(
-                    "lonelyIsland", "52", file_id, "image/png"
+                    "lonelyIsland",
+                    "52",
+                    file_id,
+                    "image/png",
+                    origin_sha256=SMALL_PNG_SHA256,
                 )
             )
 
@@ -2817,6 +2821,7 @@ class AuthenticatedMediaTestCase(unittest.HomeserverTestCase):
                     "user_id": "someone",
                     "url_cache": None,
                     "authenticated": False,
+                    "sha256": SMALL_PNG_SHA256,
                 },
                 desc="store_local_media",
             )
@@ -2886,7 +2891,7 @@ class AuthenticatedMediaTestCase(unittest.HomeserverTestCase):
                 time_now_ms=self.clock.time_msec(),
                 upload_name="remote_test.png",
                 filesystem_id=file_id,
-                sha256=file_id,
+                sha256=SMALL_PNG_SHA256,
             )
         )
 
@@ -2894,7 +2899,11 @@ class AuthenticatedMediaTestCase(unittest.HomeserverTestCase):
         if self.extra_config == {"dynamic_thumbnails": False}:
             self.get_success(
                 self.repo._generate_thumbnails(
-                    "lonelyIsland", "52", file_id, "image/png"
+                    "lonelyIsland",
+                    "52",
+                    file_id,
+                    "image/png",
+                    origin_sha256=SMALL_PNG_SHA256,
                 )
             )
 

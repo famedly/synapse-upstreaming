@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import sys
 import time
 from collections.abc import Set
@@ -587,6 +588,19 @@ class HomeserverTestCase(TestCase):
         calling the prepare function.
         """
         # We need to share the reactor between the homeserver and all of our test utils.
+        # Prepare the media store directories. These are based on a relative path to the
+        # working directory
+        temp_path = self.mktemp()
+        # Remove the directories once the test has finished.
+        self.addCleanup(_remove_temp_dir, os.path.dirname(temp_path))
+        base_temp_path = temp_path + "/"
+        self._media_store_path = base_temp_path + "media"
+        os.makedirs(self._media_store_path, exist_ok=True)
+        # Not all tests have a media storage provider setup. Just in case they do
+        # provide them a standard place inside the isolated directory
+        self._media_storage_provider_path = base_temp_path + "media_storage"
+        os.makedirs(self._media_storage_provider_path, exist_ok=True)
+
         self.reactor, self.clock = get_clock()
         self.hs = self.make_homeserver(self.reactor, self.clock)
 
@@ -726,7 +740,9 @@ class HomeserverTestCase(TestCase):
         Get a default HomeServer config dict.
         """
         config = default_config(server_name="test")
-
+        # The media store path is now generated for each test run, and it will not be
+        # detected in the static method 'default_config()'. Overload it now
+        config["media_store_path"] = self._media_store_path
         # apply any additional config which was specified via the override_config
         # decorator.
         if self._extra_config is not None:
@@ -1498,6 +1514,17 @@ class FederatingHomeserverTestCase(HomeserverTestCase):
             signing_key=self.OTHER_SERVER_SIGNATURE_KEY,
         )
         return event_dict
+
+
+def _remove_temp_dir(path: str) -> None:
+    """Remove a directory made by `mktemp`, and its parent directories named after
+    the test while they are empty."""
+    shutil.rmtree(path, ignore_errors=True)
+    try:
+        os.removedirs(os.path.dirname(path))
+    except OSError:
+        # Another test still has files there.
+        pass
 
 
 def _auth_header_for_request(

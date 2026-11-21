@@ -158,6 +158,11 @@ class FileStorageProviderBackend(StorageProvider):
         primary_fname = os.path.join(self.cache_directory, path)
         backup_fname = os.path.join(self.base_directory, path)
 
+        # A SHA-256 path is content-addressed, so an existing backup already
+        # contains these bytes and does not need to be copied again.
+        if file_info.sha256 and os.path.isfile(backup_fname):
+            return
+
         dirname = os.path.dirname(backup_fname)
         os.makedirs(dirname, exist_ok=True)
 

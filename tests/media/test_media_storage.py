@@ -18,6 +18,7 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+import hashlib
 import os
 import shutil
 import tempfile
@@ -47,7 +48,13 @@ from synapse.http.types import QueryParams
 from synapse.logging.context import make_deferred_yieldable
 from synapse.media._base import FileInfo, ThumbnailInfo
 from synapse.media.filepath import MediaFilePaths
-from synapse.media.media_storage import MediaStorage, ReadableFileWrapper
+from synapse.media.media_storage import (
+    _MEDIA_TEMP_FILE_PREFIX,
+    FileResponder,
+    MediaStorage,
+    ReadableFileWrapper,
+    SHA256TransparentIOWriter,
+)
 from synapse.media.storage_provider import (
     FileStorageProviderBackend,
     StorageProviderWrapper,
@@ -64,10 +71,18 @@ from synapse.rest.client import login, media
 from synapse.server import HomeServer
 from synapse.types import JsonDict, RoomAlias, UserID
 from synapse.util.clock import Clock
+from synapse.util.stringutils import random_string
 
 from tests import unittest
 from tests.server import FakeChannel
-from tests.test_utils import SMALL_CMYK_JPEG, SMALL_PNG, SMALL_PNG_SHA256
+from tests.test_utils import (
+    SMALL_CMYK_JPEG,
+    SMALL_PNG,
+    SMALL_PNG_SHA256,
+    get_temp_files_from_directory,
+    read,
+    write,
+)
 from tests.unittest import override_config
 from tests.utils import default_config
 
@@ -95,48 +110,344 @@ class MediaStorageTests(unittest.HomeserverTestCase):
         ]
 
         self.filepaths = MediaFilePaths(self.primary_base_path)
+        self.secondary_filepaths = MediaFilePaths(self.secondary_base_path)
+
         self.media_storage = MediaStorage(
             hs, self.filepaths, storage_providers, local_provider
         )
 
-    def test_ensure_media_is_in_local_cache(self) -> None:
-        media_id = "some_media_id"
-        test_body = "Test\n"
+        self.media_id = "some_media_id"
+        self.test_body = b"Test\n"
+        self.sha256 = hashlib.sha256(self.test_body).hexdigest()
+        self.file_info = FileInfo(None, self.media_id, sha256=self.sha256)
 
-        # First we create a file that is in a storage provider but not in the
-        # local primary media store
-        rel_path = self.filepaths.local_media_filepath_rel(media_id)
+        self.expected_relative_media_id_path_fragment = (
+            self.filepaths.local_media_filepath_rel(self.media_id)
+        )
+        self.expected_relative_sha256_path_fragment = (
+            self.filepaths.local_media_filepath_rel(self.sha256)
+        )
+
+    def write_media_to_storage_provider(self) -> str:
+        """Write a media file to the configured storage provider"""
+        # Storage providers only get to work with the provided relative directory
+        rel_path = self.expected_relative_media_id_path_fragment
         secondary_path = os.path.join(self.secondary_base_path, rel_path)
 
         os.makedirs(os.path.dirname(secondary_path))
 
-        with open(secondary_path, "w") as f:
-            f.write(test_body)
+        with open(secondary_path, "wb") as f:
+            f.write(self.test_body)
 
-        # Now we run ensure_media_is_in_local_cache, which should copy the file
-        # to the local cache.
-        file_info = FileInfo(None, media_id)
+        return secondary_path
 
-        async def test_ensure_media() -> None:
+    def write_media_to_local_media_cache(self) -> str:
+        """Write a media file to the local media cache directory"""
+        rel_path = self.expected_relative_sha256_path_fragment
+        primary_path = os.path.join(self.primary_base_path, rel_path)
+
+        os.makedirs(os.path.dirname(primary_path))
+
+        with open(primary_path, "wb") as f:
+            f.write(self.test_body)
+
+        return primary_path
+
+    def _ensure_media_is_in_local_cache(self, file_info: FileInfo) -> tuple[str, bytes]:
+        """
+        Enter and exit the ensure_media_is_in_local_cache() context manager, reading
+        the file while inside it.
+
+        The yielded path is only guaranteed to be valid inside the context, so the
+        body must be read there. ensure_media_is_in_local_cache() uses a real
+        threadpool (BackgroundFileConsumer), which get_success() waits on.
+
+        Returns:
+            The yielded path and the file contents read inside the context.
+        """
+
+        async def _read_local_copy() -> tuple[str, bytes]:
             async with self.media_storage.ensure_media_is_in_local_cache(
                 file_info
             ) as local_path:
-                self.assertTrue(os.path.exists(local_path))
+                with open(local_path, "rb") as f:
+                    return local_path, f.read()
 
-                # Asserts the file is under the expected local cache directory
-                self.assertEqual(
-                    os.path.commonprefix([self.primary_base_path, local_path]),
-                    self.primary_base_path,
+        return self.get_success(_read_local_copy())
+
+    def test_ensure_media_is_in_local_cache(self) -> None:
+        """
+        Test ensure_media_is_in_local_cache() behavior when copying media to the local
+        cache
+        """
+        # First we create a file that is in a storage provider but not in the
+        # local primary media store
+        self.write_media_to_storage_provider()
+
+        # Now we run ensure_media_is_in_local_cache(), which should copy the file
+        # to the local cache.
+        local_path, body = self._ensure_media_is_in_local_cache(self.file_info)
+
+        self.assertEqual(self.test_body, body)
+
+        # Asserts the file is under the expected local cache directory
+        self.assertEqual(
+            os.path.commonprefix([self.primary_base_path, local_path]),
+            self.primary_base_path,
+        )
+
+        # The local cache is persistent, so the file must survive the context exiting
+        self.assertTrue(os.path.exists(local_path))
+
+    def test_ensure_media_is_in_local_cache_prefers_sha256_path(self) -> None:
+        sha256_path = self.filepaths.local_media_filepath(SMALL_PNG_SHA256)
+        write(sha256_path, SMALL_PNG)
+        write(self.filepaths.local_media_filepath("media_id"), b"media id copy")
+
+        path, body = self._ensure_media_is_in_local_cache(
+            FileInfo(None, "media_id", sha256=SMALL_PNG_SHA256)
+        )
+
+        self.assertEqual(path, sha256_path)
+        self.assertEqual(SMALL_PNG, body)
+
+    def test_ensure_media_is_in_local_cache_falls_back_to_media_id_path(self) -> None:
+        """Media stored before deduplication is read from its media-ID path and is
+        not moved."""
+        media_id_path = self.filepaths.local_media_filepath("media_id")
+        write(media_id_path, SMALL_PNG)
+
+        path, body = self._ensure_media_is_in_local_cache(
+            FileInfo(None, "media_id", sha256=SMALL_PNG_SHA256)
+        )
+
+        self.assertEqual(path, media_id_path)
+        self.assertEqual(SMALL_PNG, body)
+        self.assertFalse(
+            os.path.exists(self.filepaths.local_media_filepath(SMALL_PNG_SHA256))
+        )
+
+    @parameterized.expand([("sha256", SMALL_PNG_SHA256), ("media_id", "media_id")])
+    def test_ensure_media_is_in_local_cache_caches_provider_file_at_same_path(
+        self, _name: str, identifier: str
+    ) -> None:
+        """A file fetched from a storage provider is cached locally at the path
+        the provider had it at."""
+        write(self.secondary_filepaths.local_media_filepath(identifier), SMALL_PNG)
+
+        path, body = self._ensure_media_is_in_local_cache(
+            FileInfo(None, "media_id", sha256=SMALL_PNG_SHA256)
+        )
+
+        self.assertEqual(path, self.filepaths.local_media_filepath(identifier))
+        self.assertEqual(SMALL_PNG, body)
+        self.assertEqual(get_temp_files_from_directory(self.primary_base_path), [])
+
+    def test_ensure_media_is_in_local_cache_failed_download(self) -> None:
+        """A failed download from a storage provider must not leave a (partial)
+        file in the local cache, which later calls would treat as cached.
+        """
+        media_id = "some_media_id"
+
+        # Put the file in the storage provider only.
+        rel_path = self.filepaths.local_media_filepath_rel(media_id)
+        secondary_path = os.path.join(self.secondary_base_path, rel_path)
+        os.makedirs(os.path.dirname(secondary_path))
+        with open(secondary_path, "w") as f:
+            f.write("Test\n")
+
+        async def test_ensure_media() -> None:
+            async with self.media_storage.ensure_media_is_in_local_cache(
+                FileInfo(None, media_id)
+            ):
+                pass
+
+        # Make the copy out of the storage provider fail.
+        with patch.object(
+            FileResponder,
+            "write_to_consumer",
+            side_effect=Exception("Simulated download failure"),
+        ):
+            self.get_failure(test_ensure_media(), Exception)
+
+        # Neither the cached file nor a leftover temporary file should exist. The
+        # download goes to a temporary file in the media store root.
+        self.assertFalse(os.path.exists(os.path.join(self.primary_base_path, rel_path)))
+        self.assertEqual(
+            [
+                name
+                for name in os.listdir(self.primary_base_path)
+                if name.startswith("synapse-media-")
+            ],
+            [],
+        )
+
+    def _fetch_media(self, file_info: FileInfo) -> bytes | None:
+        responder = self.get_success(self.media_storage.fetch_media(file_info))
+        if responder is None:
+            return None
+        assert isinstance(responder, FileResponder)
+        with responder:
+            return responder.open_file.read()
+
+    def test_fetch_media_from_local_media_cache(self) -> None:
+        """Tests that fetch_media() can retrieve media from any local media cache path"""
+        # First we create a file that is in the local primary media store based on the
+        # path dictated by the de-duplication setting
+        self.write_media_to_local_media_cache()
+        # Now we run fetch_media(), which should return a responder with the file
+        content = self._fetch_media(self.file_info)
+        self.assertEqual(content, self.test_body)
+
+    def test_fetch_media_from_storage_provider(self) -> None:
+        """Test that media in the storage provider can be served back directly"""
+        # First we create a file that is in a storage provider but not in the
+        # local primary media store
+        self.write_media_to_storage_provider()
+        # Now we run fetch_media(), which should return a responder with the file
+        content = self._fetch_media(self.file_info)
+        self.assertEqual(content, self.test_body)
+
+    def test_fetch_prefers_sha256_path(self) -> None:
+        write(self.filepaths.local_media_filepath(SMALL_PNG_SHA256), b"sha256")
+        write(self.filepaths.local_media_filepath("media_id"), b"media id")
+
+        content = self._fetch_media(FileInfo(None, "media_id", sha256=SMALL_PNG_SHA256))
+
+        self.assertEqual(content, b"sha256")
+
+    def test_fetch_falls_back_to_media_id_path_in_provider(self) -> None:
+        write(self.secondary_filepaths.local_media_filepath("media_id"), b"media id")
+
+        content = self._fetch_media(FileInfo(None, "media_id", sha256=SMALL_PNG_SHA256))
+
+        self.assertEqual(content, b"media id")
+
+    def _store_into_file(self, file_info: FileInfo, content: bytes) -> str:
+        """Store `content` with `store_into_file`, returning the yielded path."""
+        ctx = self.media_storage.store_into_file(file_info)
+        (f, fname) = self.get_success(ctx.__aenter__())
+        f.write(content)
+        self.get_success(ctx.__aexit__(None, None, None))
+        return fname
+
+    def _thumbnail_info(
+        self, origin_sha256: str | None, media_id: str = "media_id"
+    ) -> FileInfo:
+        return FileInfo(
+            None,
+            media_id,
+            thumbnail=ThumbnailInfo(
+                width=32,
+                height=32,
+                method="scale",
+                type="image/png",
+                length=len(b"thumbnail"),
+            ),
+            sha256=origin_sha256,
+        )
+
+    def test_store_into_file_new_media_is_stored_under_sha256_path(self) -> None:
+        """New media is written to a temporary file, then moved onto its SHA-256
+        path, and sent to the storage provider under the same path."""
+        fname = self._store_into_file(FileInfo(None, "media_id"), SMALL_PNG)
+
+        self.assertTrue(os.path.basename(fname).startswith(_MEDIA_TEMP_FILE_PREFIX))
+        self.assertEqual(
+            read(self.filepaths.local_media_filepath(SMALL_PNG_SHA256)), SMALL_PNG
+        )
+        self.assertFalse(
+            os.path.exists(self.filepaths.local_media_filepath("media_id"))
+        )
+        self.assertEqual(
+            read(self.secondary_filepaths.local_media_filepath(SMALL_PNG_SHA256)),
+            SMALL_PNG,
+        )
+        self.assertEqual(get_temp_files_from_directory(self.primary_base_path), [])
+
+    def test_store_into_file_existing_sha256_file_is_not_replaced(self) -> None:
+        """An existing SHA-256 file is kept, the temporary file is dropped, and the
+        storage providers are not written to."""
+        sha256_path = self.filepaths.local_media_filepath(SMALL_PNG_SHA256)
+        write(sha256_path, b"existing")
+
+        self._store_into_file(FileInfo(None, "media_id"), SMALL_PNG)
+
+        self.assertEqual(read(sha256_path), b"existing")
+        self.assertFalse(
+            os.path.exists(
+                self.secondary_filepaths.local_media_filepath(SMALL_PNG_SHA256)
+            )
+        )
+        self.assertEqual(get_temp_files_from_directory(self.primary_base_path), [])
+
+    def test_store_into_file_failed_write_keeps_shared_sha256_file(self) -> None:
+        """A failure inside the block only removes the temporary file."""
+        sha256_path = self.filepaths.local_media_filepath(SMALL_PNG_SHA256)
+        write(sha256_path, SMALL_PNG)
+
+        async def store() -> None:
+            async with self.media_storage.store_into_file(
+                FileInfo(None, "media_id")
+            ) as (f, _):
+                f.write(SMALL_PNG)
+                raise Exception("Simulated failure")
+
+        self.get_failure(store(), Exception)
+
+        self.assertEqual(read(sha256_path), SMALL_PNG)
+        self.assertEqual(get_temp_files_from_directory(self.primary_base_path), [])
+
+    def test_thumbnail_with_sha256_is_moved_onto_sha256_path(self) -> None:
+        """A shared SHA-256 path is never opened with `wb`: the thumbnail goes to a
+        temporary file that `local_filepath` points past."""
+        file_info = self._thumbnail_info(SMALL_PNG_SHA256)
+        fname = self._store_into_file(file_info, b"thumbnail")
+
+        self.assertTrue(os.path.basename(fname).startswith(_MEDIA_TEMP_FILE_PREFIX))
+        kept_path = self.media_storage.local_filepath(file_info)
+        assert kept_path is not None
+        self.assertEqual(
+            os.path.dirname(kept_path),
+            self.filepaths.local_media_thumbnail_dir(SMALL_PNG_SHA256),
+        )
+        self.assertEqual(read(kept_path), b"thumbnail")
+
+    def test_thumbnail_without_sha256_is_written_in_media_id_path(self) -> None:
+        """A thumbnail without the original media's SHA-256 is written directly to
+        its media ID path, and nowhere else."""
+        media_id = random_string(24)
+        file_info = self._thumbnail_info(None, media_id)
+        fname = self._store_into_file(file_info, b"thumbnail")
+
+        expected_path = self.filepaths.local_media_thumbnail(
+            media_id, 32, 32, "image/png", "scale"
+        )
+        # Written in place: the yielded path is the final path, with no temp file.
+        self.assertEqual(fname, expected_path)
+        self.assertEqual(self.media_storage.local_filepath(file_info), expected_path)
+        self.assertEqual(read(expected_path), b"thumbnail")
+        self.assertEqual(get_temp_files_from_directory(self.primary_base_path), [])
+
+        # It is the only thumbnail on disk, so nothing went to a SHA-256 path.
+        thumbnails = [
+            os.path.join(root, name)
+            for root, _, names in os.walk(
+                os.path.join(self.primary_base_path, "local_thumbnails")
+            )
+            for name in names
+        ]
+        self.assertEqual(thumbnails, [expected_path])
+
+        # The storage provider gets it under the same media ID path.
+        self.assertEqual(
+            read(
+                self.secondary_filepaths.local_media_thumbnail(
+                    media_id, 32, 32, "image/png", "scale"
                 )
-
-                with open(local_path) as f:
-                    body = f.read()
-
-                self.assertEqual(test_body, body)
-
-        # This uses a real blocking threadpool so we have to wait for it to be
-        # actually done :/
-        self.get_success(test_ensure_media())
+            ),
+            b"thumbnail",
+        )
 
     @parameterized.expand([("local_provider", True), ("temp_file", False)])
     def test_store_into_file_removes_file_on_write_failure(
@@ -169,6 +480,23 @@ class MediaStorageTests(unittest.HomeserverTestCase):
 
         self.assertEqual(len(media_filepaths), 1)
         self.assertFalse(os.path.exists(media_filepaths[0]))
+
+    def test_get_or_wrap_reuses_hashing_writer(self) -> None:
+        """New media gets a hashing writer, which `get_or_wrap` returns as-is."""
+
+        async def store() -> str:
+            async with self.media_storage.store_into_file(
+                FileInfo(None, "media_id")
+            ) as (f, _):
+                writer = SHA256TransparentIOWriter.get_or_wrap(f)
+                self.assertIs(writer, f)
+                writer.write(SMALL_PNG)
+                return writer.hexdigest()
+
+        self.assertEqual(self.get_success(store()), SMALL_PNG_SHA256)
+
+        plain = BytesIO()
+        self.assertIsNot(SHA256TransparentIOWriter.get_or_wrap(plain), plain)
 
 
 @attr.s(auto_attribs=True, slots=True, frozen=True)

@@ -40,6 +40,7 @@ from twisted.web.http import RESPONSES
 from twisted.web.http_headers import Headers
 from twisted.web.iweb import IResponse
 
+from synapse.media.media_storage import _MEDIA_TEMP_FILE_PREFIX
 from synapse.media.storage_provider import (
     FileStorageProviderBackend,
     StorageProviderWrapper,
@@ -53,6 +54,26 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 TV = TypeVar("TV")
+
+
+def write(path: str, content: bytes) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(content)
+
+
+def read(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def get_temp_files_from_directory(directory: str) -> list[str]:
+    """Temporary media files left in the root of the media store."""
+    return [
+        name
+        for name in os.listdir(directory)
+        if name.startswith(_MEDIA_TEMP_FILE_PREFIX)
+    ]
 
 
 def list_stored_media_files(hs: "HomeServer") -> set[str]:
@@ -190,3 +211,7 @@ ERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6g4SFhoeIiYqSk5SVlp
 eYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2drh4uPk5
 ebn6Onq8fLz9PX29/j5+v/aAA4EQwBNAFkASwAAPwD3+vf69/r3+v/Z
 """)
+
+SMALL_PNG_SHA256_PATH = (
+    "eb/f4/f635a17d10d6eb46ba680b70142419aa3220f228001a036d311a22ee9d2a"
+)

@@ -748,6 +748,30 @@ class MediaRepositoryStore(MediaRepositoryBackgroundUpdateStore):
             desc="store_cached_remote_media",
         )
 
+    async def set_cached_remote_media_sha256_if_missing(
+        self, origin: str, media_id: str, sha256: str
+    ) -> bool:
+        """Record the SHA-256 of remote media stored before SHA-256s were recorded.
+        A SHA-256 that is already recorded is not changed.
+
+        Returns:
+            True if the SHA-256 was recorded.
+        """
+
+        def _txn(txn: LoggingTransaction) -> bool:
+            txn.execute(
+                """
+                UPDATE remote_media_cache SET sha256 = ?
+                WHERE media_origin = ? AND media_id = ? AND sha256 IS NULL
+                """,
+                (sha256, origin, media_id),
+            )
+            return txn.rowcount > 0
+
+        return await self.db_pool.runInteraction(
+            "set_cached_remote_media_sha256_if_missing", _txn
+        )
+
     async def update_cached_last_access_time(
         self,
         local_media: Iterable[str],
@@ -1029,6 +1053,138 @@ class MediaRepositoryStore(MediaRepositoryBackgroundUpdateStore):
             get_matching_media_txn,
             "local_media_repository",
             sha256,
+        )
+
+    async def is_media_sha256_in_use(
+        self, sha256: str, server_name: str | None = None
+    ) -> bool:
+        """Whether any media is still stored under the given SHA-256 path.
+
+        Args:
+            sha256: The SHA-256 of the media.
+            server_name: The origin to check remote media from, or None to check local
+                media. URL cache media is ignored, as it is not stored by SHA-256.
+        """
+        if server_name is None:
+            sql = """
+                SELECT 1 FROM local_media_repository
+                WHERE sha256 = ? AND url_cache IS NULL
+                LIMIT 1
+            """
+            rows = await self.db_pool.execute("is_media_sha256_in_use", sql, sha256)
+        else:
+            sql = """
+                SELECT 1 FROM remote_media_cache
+                WHERE media_origin = ? AND sha256 = ?
+                LIMIT 1
+            """
+            rows = await self.db_pool.execute(
+                "is_media_sha256_in_use", sql, server_name, sha256
+            )
+        return bool(rows)
+
+    async def copy_thumbnails_with_sha256(
+        self,
+        origin_sha256: str,
+        media_id: str,
+        filesystem_id: str,
+        server_name: str | None = None,
+    ) -> bool:
+        """Copy the thumbnail rows of other media with the same SHA-256 to `media_id`.
+
+        Thumbnails of media with a SHA-256 are stored under the SHA-256 path, so
+        media with the same content only needs its own rows to share the files.
+        The rows are copied from a single source media, so they form one complete
+        set. Rows that `media_id` already has are kept.
+
+        Args:
+            origin_sha256: The SHA-256 of the media.
+            media_id: The media ID to copy the thumbnail rows to.
+            filesystem_id: The filesystem ID of the remote media to copy to.
+                Ignored for local media.
+            origin: The origin of remote media, or None for local media. URL cache
+                media is ignored, as it is not stored by SHA-256.
+
+        Returns:
+            Whether other media with thumbnails was found and its rows copied.
+        """
+
+        def copy_thumbnails_with_sha256_txn(txn: LoggingTransaction) -> bool:
+            if server_name is None:
+                # Find one other local media with this content and thumbnails.
+                txn.execute(
+                    """
+                    SELECT m.media_id FROM local_media_repository AS m
+                    WHERE m.sha256 = ? AND m.url_cache IS NULL AND m.media_id != ?
+                        AND EXISTS (
+                            SELECT 1 FROM local_media_repository_thumbnails AS t
+                            WHERE t.media_id = m.media_id
+                        )
+                    LIMIT 1
+                    """,
+                    (origin_sha256, media_id),
+                )
+                row = txn.fetchone()
+                if row is None:
+                    return False
+                # SQLite requires a WHERE clause on an INSERT ... SELECT with an
+                # ON CONFLICT clause, which this query has.
+                txn.execute(
+                    """
+                    INSERT INTO local_media_repository_thumbnails (
+                        media_id, thumbnail_width, thumbnail_height,
+                        thumbnail_type, thumbnail_method, thumbnail_length
+                    )
+                    SELECT
+                        ?, thumbnail_width, thumbnail_height,
+                        thumbnail_type, thumbnail_method, thumbnail_length
+                    FROM local_media_repository_thumbnails
+                    WHERE media_id = ?
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (media_id, row[0]),
+                )
+                return True
+
+            # Remote thumbnails are stored per origin, so only media from the
+            # same origin shares the SHA-256 thumbnail files.
+            txn.execute(
+                """
+                SELECT m.media_id FROM remote_media_cache AS m
+                WHERE m.media_origin = ? AND m.sha256 = ? AND m.media_id != ?
+                    AND EXISTS (
+                        SELECT 1 FROM remote_media_cache_thumbnails AS t
+                        WHERE t.media_origin = m.media_origin
+                            AND t.media_id = m.media_id
+                    )
+                LIMIT 1
+                """,
+                (server_name, origin_sha256, media_id),
+            )
+            row = txn.fetchone()
+            if row is None:
+                return False
+            txn.execute(
+                """
+                INSERT INTO remote_media_cache_thumbnails (
+                    media_origin, media_id, filesystem_id, thumbnail_width,
+                    thumbnail_height, thumbnail_type, thumbnail_method,
+                    thumbnail_length
+                )
+                SELECT
+                    media_origin, ?, ?, thumbnail_width,
+                    thumbnail_height, thumbnail_type, thumbnail_method,
+                    thumbnail_length
+                FROM remote_media_cache_thumbnails
+                WHERE media_origin = ? AND media_id = ?
+                ON CONFLICT DO NOTHING
+                """,
+                (media_id, filesystem_id, server_name, row[0]),
+            )
+            return True
+
+        return await self.db_pool.runInteraction(
+            "copy_thumbnails_with_sha256", copy_thumbnails_with_sha256_txn
         )
 
     async def get_media_uploaded_size_for_user(
